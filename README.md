@@ -4,8 +4,7 @@ A fan-made **native** Nintendo 3DS port of The Legend of Zelda: Majora's Mask (N
 [zeldaret/mm](https://github.com/zeldaret/mm) decompilation. It continues
 [Andresac90's Majora's Mask 3DS port](https://github.com/Andresac90/MM-64-3DS-Port) (through
 [casrielasriel's fork](https://github.com/casrielasriel/MM-64-3DS-Port) of it), which grew out of Andresac90's
-[Ocarina of Time 3DS port](https://github.com/Andresac90/OOT-64-3DS-Port). This release finishes it: the bugs that kept
-the game from being played through are fixed, and it is polished and extended (see Features).
+[Ocarina of Time 3DS port](https://github.com/Andresac90/OOT-64-3DS-Port). This release finishes it
 
 > **Status: first release.** The whole game is playable. A New 3DS is recommended: it runs at 60 fps. An Old 3DS
 > runs it too, but slows down in large areas such as Clock Town (see [Known issues](#known-issues)).
