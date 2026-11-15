@@ -1,4 +1,5 @@
 #include "global.h"
+#include "port_minimap.h"
 #include "PR/gs2dex.h"
 #include "sys_cfb.h"
 #include "sys_cmpdma.h"
@@ -1892,7 +1893,11 @@ void Interface_UpdateButtonsPart2(PlayState* play) {
         }
 
         for (i = EQUIP_SLOT_C_LEFT; i <= EQUIP_SLOT_C_RIGHT; i++) {
-            if (GET_CUR_FORM_BTN_ITEM(i) != ITEM_MASK_ZORA) {
+            /* PORT (2026-11-08): 2S2H Player/UnderwaterOcarina (GAMEPLAY: Underwater ocarina): the ocarina stays usable
+             * on the bottom of the water (Zora Link's guitar) */
+            if ((GET_CUR_FORM_BTN_ITEM(i) != ITEM_MASK_ZORA) &&
+                !(PORT_ENH(ENH_UNDERWATER_OCARINA) && (GET_CUR_FORM_BTN_ITEM(i) == ITEM_OCARINA_OF_TIME) &&
+                  (Player_GetEnvironmentalHazard(play) == PLAYER_ENV_HAZARD_UNDERWATER_FLOOR))) {
                 if (Player_GetEnvironmentalHazard(play) == PLAYER_ENV_HAZARD_UNDERWATER_FLOOR) {
                     if (!((GET_CUR_FORM_BTN_ITEM(i) >= ITEM_BOTTLE) &&
                           (GET_CUR_FORM_BTN_ITEM(i) <= ITEM_OBABA_DRINK))) {
@@ -2048,7 +2053,8 @@ void Interface_UpdateButtonsPart2(PlayState* play) {
                 //! dimension has only been allocated 114 elements. This leads to inconsistent behaviour when checking
                 //! the status of empty C-buttons - for most forms, the C-buttons are enabled when empty, however for
                 //! Deku Link only, empty C-buttons are disabled.
-                if (!gPlayerFormItemRestrictions[GET_PLAYER_FORM][GET_CUR_FORM_BTN_ITEM(i)]) {
+                if (!gPlayerFormItemRestrictions[GET_PLAYER_FORM][GET_CUR_FORM_BTN_ITEM(i)] &&
+                    !PORT_CHEAT_ON(CHEAT_UNRESTRICT)) {
                     // Item not usable in current playerForm
                     if (gSaveContext.buttonStatus[i] != BTN_DISABLED) {
                         gSaveContext.buttonStatus[i] = BTN_DISABLED;
@@ -2086,7 +2092,7 @@ void Interface_UpdateButtonsPart2(PlayState* play) {
                     // Fierce Deity's Mask is equipped
                     if ((play->sceneId != SCENE_MITURIN_BS) && (play->sceneId != SCENE_HAKUGIN_BS) &&
                         (play->sceneId != SCENE_SEA_BS) && (play->sceneId != SCENE_INISIE_BS) &&
-                        (play->sceneId != SCENE_LAST_BS)) {
+                        (play->sceneId != SCENE_LAST_BS) && !PORT_CHEAT_ON(CHEAT_FIERCE)) {
                         if (gSaveContext.buttonStatus[i] != BTN_DISABLED) {
                             gSaveContext.buttonStatus[i] = BTN_DISABLED;
                             restoreHudVisibility = true;
@@ -3304,8 +3310,20 @@ void Interface_LoadAButtonDoActionLabel(InterfaceContext* interfaceCtx, u16 doAc
                             &interfaceCtx->loadQueue, NULL);
         osRecvMesg(&interfaceCtx->loadQueue, NULL, OS_MESG_BLOCK);
     } else {
+#ifdef __3DS__
+        // PORT (2026-11-14): sDoActionTextures are the port's built-in copies of the labels, not segment 0x09 addresses:
+        // this cleared the built-in "Attack" and "Check" textures themselves, and every later load copied the blank (no
+        // "Attack" / "Check" on the A button). Clear the label buffer the N64 code means, and drop its cached texture.
+        extern void gfx_texture_cache_invalidate_range(const void* start, u32 size);
+        u8* buf = interfaceCtx->doActionSegment + DO_ACTION_OFFSET_A_ACTIVE + slot * DO_ACTION_TEX_SIZE;
+
+        (void)sDoActionTextures;
+        gfx_texture_cache_invalidate_range(buf, DO_ACTION_TEX_SIZE);
+        Interface_ClearBuffer((u32*)buf, DO_ACTION_TEX_SIZE / sizeof(u32));
+#else
         gSegments[0x09] = OS_K0_TO_PHYSICAL(interfaceCtx->doActionSegment);
         Interface_ClearBuffer(Lib_SegmentedToVirtual(sDoActionTextures[slot]), DO_ACTION_TEX_SIZE / sizeof(u32));
+#endif
     }
 }
 
@@ -3403,6 +3421,9 @@ void Interface_SetBButtonInterfaceDoAction(PlayState* play, s16 bButtonDoAction)
  * @return false if player is out of health
  */
 s32 Health_ChangeBy(PlayState* play, s16 healthChange) {
+    if ((healthChange < 0) && PORT_CHEAT_ON(CHEAT_HEALTH)) {
+        healthChange = 0; /* PORT: cheat, hits take no health */
+    }
     if (healthChange > 0) {
         Audio_PlaySfx(NA_SE_SY_HP_RECOVER);
     } else if (gSaveContext.save.saveInfo.playerData.doubleDefense && (healthChange < 0)) {
@@ -4505,7 +4526,18 @@ void Interface_DrawPauseMenuEquippingIcons(PlayState* play) {
 /**
  * Draws either the analog three-day clock or the digital final-hours clock
  */
+#ifdef __3DS__
+/* PORT: the Song of Double Time hour picker shows its hour on the clock (ultra_shims.c) */
+static void Interface_DrawClockImpl(PlayState* play);
 void Interface_DrawClock(PlayState* play) {
+    PortDoubleTime_ClockBegin(play);
+    Interface_DrawClockImpl(play);
+    PortDoubleTime_ClockEnd(play);
+}
+static void Interface_DrawClockImpl(PlayState* play) {
+#else
+void Interface_DrawClock(PlayState* play) {
+#endif
     static s16 sThreeDayClockAlpha = 255;
     static s16 sClockAlphaTimer1 = 0;
     static s16 sClockAlphaTimer2 = 0;
@@ -5610,6 +5642,12 @@ void Interface_DrawPerfectLetters(PlayState* play) {
 }
 
 void Interface_StartMoonCrash(PlayState* play) {
+#ifdef __3DS__
+    {
+        extern void PortSram_DeleteKeptOwlSave(PlayState * play);
+        PortSram_DeleteKeptOwlSave(play); /* PORT: a kept owl / pause save does not survive the moon */
+    }
+#endif
     if (play->actorCtx.flags & ACTORCTX_FLAG_TELESCOPE_ON) {
         SEQCMD_DISABLE_PLAY_SEQUENCES(false);
     }
@@ -6204,7 +6242,7 @@ void Interface_DrawMinigameIcons(PlayState* play) {
 
     if (!IS_PAUSED(&play->pauseCtx)) {
         // Carrots rendering if the action corresponds to riding a horse
-        if (interfaceCtx->aButtonDoActionDelayed == DO_ACTION_FASTER) {
+        if ((interfaceCtx->aButtonDoActionDelayed == DO_ACTION_FASTER) && !PORT_CHEAT_ON(CHEAT_CARROTS)) {
             // Load Carrot Icon
             gDPLoadTextureBlock(OVERLAY_DISP++, gCarrotIconTex, G_IM_FMT_RGBA, G_IM_SIZ_32b, 16, 16, 0,
                                 G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK,
@@ -6949,6 +6987,33 @@ void Interface_Update(PlayState* play) {
     }
 
     LifeMeter_UpdateColors(play);
+
+#ifdef __3DS__
+    /* PORT (2026-11-08): 2S2H Timesavers/FasterRupeeAccumulator (GAMEPLAY: Fast rupee count): a fiftieth of the wallet
+     * a frame on top of the game's one, so a full wallet fills or drains in under a second */
+    if (PORT_ENH(ENH_FAST_RUPEES) && (gSaveContext.rupeeAccumulator != 0)) {
+        s16 capacity = (s16)CUR_CAPACITY(UPG_WALLET);
+        s16 step = capacity / 50;
+        s16 amount;
+
+        if (gSaveContext.rupeeAccumulator > 0) {
+            amount = CLAMP_MAX(gSaveContext.rupeeAccumulator,
+                               (s16)(capacity - gSaveContext.save.saveInfo.playerData.rupees));
+            amount = CLAMP_MAX(amount, step);
+            if (amount > 0) {
+                gSaveContext.rupeeAccumulator -= amount;
+                gSaveContext.save.saveInfo.playerData.rupees += amount;
+            }
+        } else {
+            amount = CLAMP_MAX((s16)-gSaveContext.rupeeAccumulator, gSaveContext.save.saveInfo.playerData.rupees);
+            amount = CLAMP_MAX(amount, step);
+            if (amount > 0) {
+                gSaveContext.rupeeAccumulator += amount;
+                gSaveContext.save.saveInfo.playerData.rupees -= amount;
+            }
+        }
+    }
+#endif
 
     // Update rupees
     if (gSaveContext.rupeeAccumulator != 0) {

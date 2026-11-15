@@ -50,7 +50,7 @@ uint16_t PortZBuf_Read(int x, int y) {
 
     Port3ds_RequestDepth(); /* keeps the per-frame readback alive while the game samples depth */
     depth = Port3ds_GetDepth(&w, &h);
-    if (depth == NULL || x < 0 || x >= 320 || y < 0 || y >= 240) {
+    if (depth == NULL || x < -40 || x >= 360 || y < 0 || y >= 240) { /* (-40 / 360: widescreen's sides) */
         return N64_Z_FAR;
     }
     sx = h / 400;
@@ -77,5 +77,21 @@ uint16_t PortZBuf_Read(int x, int y) {
      * same point. Measured over 229,589 same-surface pixels in 4 captures (tools/statediff): median of
      * N64 - 3DS = +1, and +1 minimizes the mean error. Matters for glows sitting on their own geometry
      * (torch flames): N64 draws them, an unbiased 3DS value fails the strict test and hides them. */
+    {
+        /* PORT (2026-10-28): the 3D scene's depth is linear (w / 32768, gfx_citro3d.c W-buffer): back to the N64's
+         * (ndc z + 1) / 2 through the latest perspective projection (gfx_pc.c gPortDepthP) */
+        extern float gPortDepthP[3];
+        extern int gPortDepthLinear;
+        float wv = (float)d / (float)0xFFFFFF * 32768.0f, nz;
+        if (!gPortDepthLinear) {
+            nz = (float)d / (float)0xFFFFFF; /* the original z-buffer: already the N64's (ndc z + 1) / 2 */
+        } else {
+        if (wv < 1.0f) wv = 1.0f;
+        nz = (gPortDepthP[0] / gPortDepthP[2] + gPortDepthP[1] / wv + 1.0f) * 0.5f; /* z/w = P22/P23 + P32/w */
+        if (nz < 0.0f) nz = 0.0f;
+        if (nz > 1.0f) nz = 1.0f;
+        }
+        d = (uint32_t)(nz * (float)0xFFFFFF);
+    }
     return encode_n64_z((((d * 0x7FC0ull) / 0xFFFFFF) + 1) << 3);
 }

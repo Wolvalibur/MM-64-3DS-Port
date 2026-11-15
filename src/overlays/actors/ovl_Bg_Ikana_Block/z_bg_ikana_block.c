@@ -5,6 +5,7 @@
  */
 
 #include "z_bg_ikana_block.h"
+#include "port_minimap.h"
 #include "assets/objects/gameplay_dangeon_keep/gameplay_dangeon_keep.h"
 
 #define FLAGS (ACTOR_FLAG_UPDATE_CULLING_DISABLED)
@@ -68,7 +69,9 @@ void func_80B7EA60(BgIkanaBlock* this) {
 
 void func_80B7EB30(BgIkanaBlock* this) {
     if (this->unk_17A & (0x8 | 0x4 | 0x2 | 0x1)) {
-        if (this->unk_17B < 127) {
+        if (PORT_ENH(ENH_FAST_PUSH)) { /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
+            this->unk_17B = 11;
+        } else if (this->unk_17B < 127) {
             this->unk_17B++;
         }
     } else {
@@ -288,7 +291,8 @@ void func_80B7F290(BgIkanaBlock* this, PlayState* play) {
 
     Math_StepToF(&this->unk_16C, 2.0f, 0.4f);
 
-    if (Math_StepToF(this->unk_164, this->unk_168, this->unk_16C)) {
+    if (Math_StepToF(this->unk_164, this->unk_168, this->unk_16C) ||
+        (PORT_ENH(ENH_FAST_PUSH) && Math_StepToF(this->unk_164, this->unk_168, this->unk_16C))) { /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
         Player* player = GET_PLAYER(play);
 
         if (!func_80B7EB94(this, play)) {

@@ -5,6 +5,7 @@
  */
 
 #include "z_en_horse.h"
+#include "port_minimap.h" /* PORT: cheats */
 #include "z64horse.h"
 #include "z64rumble.h"
 #include "z64voice.h"
@@ -4024,7 +4025,9 @@ void EnHorse_CheckBoost(EnHorse* this, PlayState* play) {
             this->stateFlags |= ENHORSE_BOOST;
             this->stateFlags |= ENHORSE_FIRST_BOOST_REGEN;
             this->stateFlags |= ENHORSE_FLAG_8;
-            this->numBoosts--;
+            if (!PORT_CHEAT_ON(CHEAT_CARROTS)) {
+                this->numBoosts--; /* PORT: cheat, infinite carrots */
+            }
             this->boostTimer = 0;
             if (this->numBoosts == 0) {
                 this->boostRegenTime = 140;

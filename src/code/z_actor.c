@@ -1,3 +1,7 @@
+#ifdef __3DS__
+#include "port_interp.h"
+#include "port_minimap.h"
+#endif
 /*
  * File: z_actor.c
  * Description:
@@ -107,6 +111,11 @@ void ActorShadow_Draw(Actor* actor, Lights* lights, PlayState* play, Gfx* dList,
             OPEN_DISPS(play->state.gfxCtx);
 
             POLY_OPA_DISP = Gfx_SetupDL(POLY_OPA_DISP, SETUPDL_44);
+#ifdef __3DS__
+            /* PORT (2026-11-08): (its own group per shape: Link's feet draw a circle only in the air, before the feet's
+             * shadows - it must not shift their pairing) */
+            gPortInterpPush(POLY_OPA_DISP++, 0x5AD10000u ^ (u32)(uintptr_t)dList, 0);
+#endif
 
             gDPSetCombineLERP(POLY_OPA_DISP++, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, COMBINED, 0, 0, 0,
                               COMBINED);
@@ -136,6 +145,9 @@ void ActorShadow_Draw(Actor* actor, Lights* lights, PlayState* play, Gfx* dList,
 
             MATRIX_FINALIZE_AND_LOAD(POLY_OPA_DISP++, play->state.gfxCtx);
             gSPDisplayList(POLY_OPA_DISP++, dList);
+#ifdef __3DS__
+            gPortInterpPop(POLY_OPA_DISP++);
+#endif
 
             CLOSE_DISPS(play->state.gfxCtx);
         }
@@ -168,6 +180,9 @@ void ActorShadow_DrawHorse(Actor* actor, Lights* lights, PlayState* play) {
     ActorShadow_Draw(actor, lights, play, gHorseShadowDL, NULL);
 }
 
+#ifdef __3DS__
+static s32 sPortShadowFoot; /* the foot ActorShadow_DrawFeet is drawing (its shadows' 60 fps group) */
+#endif
 void ActorShadow_DrawFoot(PlayState* play, Light* light, MtxF* arg2, s32 lightNum, f32 shadowAlpha, f32 shadowScaleX,
                           f32 shadowScaleZ) {
     s32 pad;
@@ -177,6 +192,10 @@ void ActorShadow_DrawFoot(PlayState* play, Light* light, MtxF* arg2, s32 lightNu
 
     OPEN_DISPS(play->state.gfxCtx);
 
+#ifdef __3DS__
+    /* PORT (2026-11-08): each foot's shadows in their own group (one per light, numbered by the renderer) */
+    gPortInterpPush(POLY_OPA_DISP++, 0x5AD20000u + (u32)sPortShadowFoot, 0);
+#endif
     gDPSetPrimColor(POLY_OPA_DISP++, 0, 0, 0, 0, 0, (u8)(CLAMP_MAX(lightNum * 1.3e-05f, 1.0f) * shadowAlpha));
 
     dir0 = light->l.dir[0];
@@ -190,6 +209,9 @@ void ActorShadow_DrawFoot(PlayState* play, Light* light, MtxF* arg2, s32 lightNu
 
     MATRIX_FINALIZE_AND_LOAD(POLY_OPA_DISP++, play->state.gfxCtx);
     gSPDisplayList(POLY_OPA_DISP++, gFootShadowDL);
+#ifdef __3DS__
+    gPortInterpPop(POLY_OPA_DISP++);
+#endif
 
     CLOSE_DISPS(play->state.gfxCtx);
 }
@@ -253,6 +275,9 @@ void ActorShadow_DrawFeet(Actor* actor, Lights* mapper, PlayState* play) {
         spB8 = 2;
 
         for (i = 0; i < ARRAY_COUNT(floorHeight); i++, spB8 >>= 1) {
+#ifdef __3DS__
+            sPortShadowFoot = i;
+#endif
             feetPosPtr->y += 50.0f;
             *floorHeightPtr = Play_GetFloorSurfaceImpl(play, &sp13C, &poly, &bgId, feetPosPtr);
             feetPosPtr->y -= 50.0f;
@@ -2236,7 +2261,7 @@ s32 Actor_HasParent(Actor* actor, PlayState* play) {
  *
  * @return true If the player actor is capable of accepting the offer.
  */
-s32 Actor_OfferGetItem(Actor* actor, PlayState* play, GetItemId getItemId, f32 xzRange, f32 yRange) {
+s32 Actor_OfferGetItem(Actor* actor, PlayState* play, s32 getItemId /* PORT: was GetItemId - a short enum on the 3DS (u8), chests pass a negative id */, f32 xzRange, f32 yRange) {
     Player* player = GET_PLAYER(play);
 
     if (!(player->stateFlags1 &
@@ -2272,7 +2297,7 @@ s32 Actor_OfferGetItem(Actor* actor, PlayState* play, GetItemId getItemId, f32 x
     return false;
 }
 
-s32 Actor_OfferGetItemNearby(Actor* actor, PlayState* play, GetItemId getItemId) {
+s32 Actor_OfferGetItemNearby(Actor* actor, PlayState* play, s32 getItemId /* PORT: was GetItemId - a short enum on the 3DS (u8), chests pass a negative id */) {
     return Actor_OfferGetItem(actor, play, getItemId, 50.0f, 10.0f);
 }
 
@@ -2280,7 +2305,7 @@ s32 Actor_OfferCarry(Actor* actor, PlayState* play) {
     return Actor_OfferGetItemNearby(actor, play, GI_NONE);
 }
 
-s32 Actor_OfferGetItemFar(Actor* actor, PlayState* play, GetItemId getItemId) {
+s32 Actor_OfferGetItemFar(Actor* actor, PlayState* play, s32 getItemId /* PORT: was GetItemId - a short enum on the 3DS (u8), chests pass a negative id */) {
     return Actor_OfferGetItem(actor, play, getItemId, 9999.9f, 9999.9f);
 }
 
@@ -2826,6 +2851,27 @@ void Actor_Draw(PlayState* play, Actor* actor) {
     gSPSegment(POLY_OPA_DISP++, 0x06, play->objectCtx.slots[actor->objectSlot].segment);
     gSPSegment(POLY_XLU_DISP++, 0x06, play->objectCtx.slots[actor->objectSlot].segment);
 
+#ifdef __3DS__
+    /* PORT (2026-10-26): 60 fps interpolation group (port_interp.h) for this actor's transforms, keyed by the actor
+     * instance, as in the OoT N64 3DS Port (Zelda64Recomp actor_transform_tagging.c). Moved more than 300 units in
+     * one update (warp, respawn, cutscene placement): drawn without blending this frame. */
+    {
+        f32 dx = actor->world.pos.x - actor->prevPos.x, dy = actor->world.pos.y - actor->prevPos.y,
+            dz = actor->world.pos.z - actor->prevPos.z;
+        u32 f = (dx * dx + dy * dy + dz * dz > 300.0f * 300.0f) ? PORT_INTERP_SKIP : 0;
+        Player* portPlayer = GET_PLAYER(play);
+        /* PORT (2026-11-15): first person (aiming the bow / hookshot, looking around): Link's arms and what he holds
+         * (the nocked arrow and the hookshot are his child actors) are blended as seen from the camera, so they stay
+         * put on screen at 60 fps instead of shaking against it (user report, video). */
+        if ((portPlayer != NULL) && (portPlayer->stateFlags1 & PLAYER_STATE1_100000) &&
+            ((actor == &portPlayer->actor) || (actor->parent == &portPlayer->actor))) {
+            f |= PORT_INTERP_CAMREL;
+        }
+        gPortInterpPush(POLY_OPA_DISP++, (u32)(uintptr_t)actor ^ ((u32)actor->id << 20), f);
+        gPortInterpPush(POLY_XLU_DISP++, (u32)(uintptr_t)actor ^ ((u32)actor->id << 20), f);
+    }
+#endif
+
     if (actor->colorFilterTimer != 0) {
         s32 colorFlag = COLORFILTER_GET_COLORFLAG(actor->colorFilterParams);
         Color_RGBA8 actorDefaultHitColor = { 0, 0, 0, 255 };
@@ -2861,9 +2907,25 @@ void Actor_Draw(PlayState* play, Actor* actor) {
     }
 
     if (actor->shape.shadowDraw != NULL) {
+#ifdef __3DS__
+        /* PORT (2026-11-08): the shadow's group is told apart by its kind (shadowDraw), so a shadow that changes kind
+         * is not blended from the other kind: Goron Link curling up goes from his feet's shadows to one big circle,
+         * and the circle was blended from a foot's shadow (stretched toward the light) - a huge stretched shadow at
+         * 60 fps (user report, photo) */
+        gPortInterpPush(POLY_OPA_DISP++, PORT_INTERP_ID_SHADOW ^ (u32)(uintptr_t)actor->shape.shadowDraw, 0);
+        gPortInterpPush(POLY_XLU_DISP++, PORT_INTERP_ID_SHADOW ^ (u32)(uintptr_t)actor->shape.shadowDraw, 0);
+#endif
         actor->shape.shadowDraw(actor, light, play);
+#ifdef __3DS__
+        gPortInterpPop(POLY_OPA_DISP++);
+        gPortInterpPop(POLY_XLU_DISP++);
+#endif
     }
     actor->isDrawn = true;
+#ifdef __3DS__
+    gPortInterpPop(POLY_OPA_DISP++);
+    gPortInterpPop(POLY_XLU_DISP++);
+#endif
 
     CLOSE_DISPS(play->state.gfxCtx);
 }
@@ -3119,8 +3181,15 @@ s32 Actor_CullingCheck(PlayState* play, Actor* actor) {
  * above: https://www.desmos.com/3d/4ztkxqky2a.
  */
 s32 Actor_CullingVolumeTest(PlayState* play, Actor* actor, Vec3f* projPos, f32 projW) {
+#ifdef __3DS__
+    /* PORT (2026-11-12): "Actor draw distance" (GAMEPLAY option, ENH_ACTOR_DISTANCE): the volume's far end 2-5x as far */
+    f32 cullingVolumeDistance = actor->cullingVolumeDistance * (1 + gPortEnh[ENH_ACTOR_DISTANCE]);
+#else
+    f32 cullingVolumeDistance = actor->cullingVolumeDistance;
+#endif
+
     if ((projPos->z > -actor->cullingVolumeScale) &&
-        (projPos->z < (actor->cullingVolumeDistance + actor->cullingVolumeScale))) {
+        (projPos->z < (cullingVolumeDistance + actor->cullingVolumeScale))) {
         f32 invW;
         f32 cullingVolumeScaleX;
         f32 cullingVolumeScaleY;
@@ -3149,10 +3218,27 @@ s32 Actor_CullingVolumeTest(PlayState* play, Actor* actor, Vec3f* projPos, f32 p
             cullingVolumeDownward = actor->cullingVolumeDownward;
         }
 
+#ifdef __3DS__
+        {
+            /* PORT (2026-11-10): "Wide actor culling" (GAMEPLAY option, ENH_WIDE_CULLING). The game culls against its own
+             * 4:3 view (projected |x| up to w), while Widescreen draws 40 more N64 pixels on each side of the 400-pixel
+             * screen (|x| up to 400 / 320 = 1.25 w): actors there froze and vanished, popping in as they reached the
+             * old 4:3 edge. With the option on (and Widescreen on), the frustum's sides move out to the wide screen's
+             * edges; the culling box behind the camera widens by the same factor. */
+            extern int gPortWidescreen;
+            f32 sideW = (gPortWidescreen && PORT_ENH(ENH_WIDE_CULLING)) ? invW * 1.25f : invW;
+
+            if (((fabsf(projPos->x) - cullingVolumeScaleX) < sideW) && ((-invW < (projPos->y + cullingVolumeDownward))) &&
+                ((projPos->y - cullingVolumeScaleY) < invW)) {
+                return true;
+            }
+        }
+#else
         if (((fabsf(projPos->x) - cullingVolumeScaleX) < invW) && ((-invW < (projPos->y + cullingVolumeDownward))) &&
             ((projPos->y - cullingVolumeScaleY) < invW)) {
             return true;
         }
+#endif
     }
 
     return false;
@@ -3168,6 +3254,11 @@ void Actor_DrawAll(PlayState* play, ActorContext* actorCtx) {
     Actor* actor;
     s32 drawActorFlagsMask;
     s32 category;
+#ifdef __3DS__
+    extern MtxF gPortPrevViewProjMtxF;
+    extern s32 gPortPrevViewProjOk;
+    s32 portDrawPrev;
+#endif
 
     if (play->soaringCsOrSoTCsPlaying) {
         drawActorFlagsMask = ACTOR_FLAG_UPDATE_DURING_SOARING_AND_SOT_CS;
@@ -3201,7 +3292,21 @@ void Actor_DrawAll(PlayState* play, ActorContext* actorCtx) {
             }
 
             actor->isDrawn = false;
+#ifdef __3DS__
+            /* PORT (2026-11-15): 60 fps: an actor outside this camera's culling volume but inside the previous logic
+             * frame's is drawn too - the in-between frames look from between the two cameras, and on a fast swing
+             * (Z-targeting behind Link) actors at the trailing edge vanished from them (z_play.c) */
+            portDrawPrev = false;
+            if (!(actor->flags & drawActorFlagsMask) && !play->soaringCsOrSoTCsPlaying && gPortPrevViewProjOk) {
+                Vec3f prevPos;
+                f32 prevW;
+                SkinMatrix_Vec3fMtxFMultXYZW(&gPortPrevViewProjMtxF, &actor->world.pos, &prevPos, &prevW);
+                portDrawPrev = Actor_CullingVolumeTest(play, actor, &prevPos, prevW);
+            }
+            if ((actor->init == NULL) && (actor->draw != NULL) && ((actor->flags & drawActorFlagsMask) || portDrawPrev)) {
+#else
             if ((actor->init == NULL) && (actor->draw != NULL) && (actor->flags & drawActorFlagsMask)) {
+#endif
                 if ((actor->flags & ACTOR_FLAG_REACT_TO_LENS) &&
                     ((play->roomCtx.curRoom.lensMode == LENS_MODE_SHOW_ACTORS) ||
                      (play->actorCtx.lensMaskSize == LENS_MASK_ACTIVE_SIZE) ||

@@ -893,6 +893,10 @@ s32 SubS_Offer(Actor* actor, PlayState* play, f32 xzRange, f32 yRange, s32 itemI
     return canAccept;
 }
 
+#ifdef __3DS__
+/* PORT (2026-11-15): writable section: the ROM-free package takes it out (see fault_drawer.c sFaultDrawerFont) */
+__attribute__((section(".data.port_rf_shadow")))
+#endif
 const u8 sShadowMaps[4][12][12] = {
     {
         { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },

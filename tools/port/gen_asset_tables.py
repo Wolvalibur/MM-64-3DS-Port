@@ -56,5 +56,459 @@ def main():
     print("%d asset segments -> port/asset_srcs.mk, port/src_gen/vrom_map.c; skipped: %s" % (len(segs), missing))
 
 
+
+
+# =====================================================================================================================
+# PORT (2026-11-07): the ROM-free package (`make -f Makefile.3ds cia-romfree`, user request: an installer others can
+# use, e.g. from a QR code). The normal build compiles the game's own data into the program: every natively linked asset
+# segment above (port_seg_*: textures, models, text...), and the few assets the decomp includes straight into code
+# (overlays' textures, the boot fonts, code's textures). That data is Nintendo's, so a build carrying it must not be
+# shared. --romfree takes the finished ELF and the decompressed ROM it was built from, and:
+#   1. finds every word of the program that came from the ROM: the asset segments mirror their ROM files byte for byte
+#      (DMA serves them as native_base + rom_offset), only in little-endian order (u64 data byte k at k ^ 7, u32 at ^ 3,
+#      u16 at ^ 1, bytes as they are) and with native pointers where the ROM has segmented addresses; the code-side
+#      assets are found by name (assets/xml) or by content in their ROM file;
+#   2. zeroes those words in the ELF (pointers and anything else not from the ROM stay);
+#   3. writes a recipe - per range: where it goes, where in the ROM it comes from, and per word how (copy, a byte-order
+#      swap, or skip) - into some of the zeroed space, with a small header in gPortRomFree (3ds_main.c);
+#   4. checks the result: replaying the recipe against the ROM gives back the original ELF exactly (same CRC).
+# At boot 3ds_main.c (PortRomFree_Restore) replays the recipe from the player's own ROM before anything runs.
+# The recipe and the remaining words are offsets, sizes, byte-order codes and pointers: no game data.
+#
+# usage: tools/port/gen_asset_tables.py --romfree IN.elf ROM-decompressed.z64 OUT.elf
+# =====================================================================================================================
+import struct
+import zlib
+
+RF_MAGIC = 0x46524D4D  # "MMRF"
+RF_VERSION = 1
+RF_HDR_WORDS = 256  # gPortRomFree[] (3ds_main.c)
+RF_MAX_SPANS = (RF_HDR_WORDS - 8) // 2
+# per-word ops: 0 skip (leave the word), else memory byte k of the word = ROM byte (k ^ x) of the range
+RF_SKIP, RF_COPY, RF_SW32, RF_SW16, RF_SW64 = 0, 1, 2, 3, 4
+RF_XOR = {RF_COPY: 0, RF_SW32: 3, RF_SW16: 1, RF_SW64: 7}
+RF_PREF = (RF_SW64, RF_COPY, RF_SW32, RF_SW16)  # (the order to try: u64 data is most of it)
+
+
+class Elf32:
+    """just enough of a little-endian ELF32 (the linked program or an object file)"""
+
+    def __init__(self, data):
+        self.d = data
+        assert data[:4] == b"\x7fELF" and data[4] == 1 and data[5] == 1, "not a little-endian ELF32"
+        shoff, = struct.unpack_from("<I", data, 0x20)
+        shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 0x2E)
+        self.sh = []
+        for i in range(shnum):
+            f = struct.unpack_from("<IIIIIIIIII", data, shoff + i * shentsize)
+            self.sh.append(dict(name_off=f[0], type=f[1], flags=f[2], addr=f[3], offset=f[4], size=f[5], link=f[6],
+                                info=f[7], align=f[8], entsize=f[9]))
+        strtab = self.sh[shstrndx]
+        for s in self.sh:
+            s["name"] = self._str(strtab, s["name_off"])
+
+    def _str(self, sec, off):
+        o = sec["offset"] + off
+        return self.d[o:self.d.index(b"\0", o)].decode("latin1")
+
+    def symbols(self):
+        """(name, value, size, type, bind, shndx) in table order"""
+        for s in self.sh:
+            if s["type"] != 2:  # SHT_SYMTAB
+                continue
+            strs = self.sh[s["link"]]
+            for i in range(s["size"] // 16):
+                nm, val, size, info, other, shndx = struct.unpack_from("<IIIBBH", self.d, s["offset"] + i * 16)
+                yield (self._str(strs, nm) if nm else "", val, size, info & 15, info >> 4, shndx)
+
+    def section_of(self, addr, n):
+        """the allocated section holding [addr, addr + n) with file contents, or None"""
+        for s in self.sh:
+            if s["flags"] & 2 and s["type"] == 1 and s["addr"] <= addr and addr + n <= s["addr"] + s["size"]:
+                return s
+        return None
+
+
+def rf_rom_files(repo):
+    """{ROM file name: (VROM start, end)} from port/rom_symbols.ld"""
+    txt = open(os.path.join(repo, "port/rom_symbols.ld")).read()
+    st = dict(re.findall(r"^_(\w+)SegmentRomStart = (0x[0-9a-fA-F]+);", txt, re.M))
+    en = dict(re.findall(r"^_(\w+)SegmentRomEnd = (0x[0-9a-fA-F]+);", txt, re.M))
+    return {k: (int(v, 16), int(en[k], 16)) for k, v in st.items() if k in en}
+
+
+def rf_word_ops(native, rom_t):
+    """per 4-byte word of `native`, the first op whose transformed ROM (rom_t[op], same length) matches it"""
+    n = len(native) // 4
+    ops = bytearray(n)
+    # whole 64-byte blocks first (one comparison each), words one by one where a block mixes
+    order = list(RF_PREF)
+    for b in range(0, n, 16):
+        lo, hi = b * 4, min(n, b + 16) * 4
+        blk = native[lo:hi]
+        hit = 0
+        for op in order:
+            if rom_t[op][lo:hi] == blk:
+                hit = op
+                break
+        if hit:
+            if order[0] != hit:  # (the last block's op first: runs of one kind)
+                order.remove(hit)
+                order.insert(0, hit)
+            ops[b:b + (hi - lo) // 4] = bytes([hit]) * ((hi - lo) // 4)
+            continue
+        for w in range(b, min(n, b + 16)):
+            word = native[w * 4:w * 4 + 4]
+            for op in order:
+                if rom_t[op][w * 4:w * 4 + 4] == word:
+                    ops[w] = op
+                    break
+    return ops
+
+
+def rf_transforms(rom, rom_off, nbytes):
+    """the ROM bytes of a range seen through each op: t[op][k] = rom[rom_off + (k ^ x)]"""
+    n8 = (nbytes + 7) & ~7
+    raw = rom[rom_off:rom_off + n8]
+    raw += b"\0" * (n8 - len(raw))
+    import array
+    t = {RF_COPY: raw[:nbytes]}
+    for op, code in ((RF_SW32, "I"), (RF_SW16, "H"), (RF_SW64, "Q")):
+        a = array.array(code)
+        assert a.itemsize == {"I": 4, "H": 2, "Q": 8}[code]
+        a.frombytes(raw)
+        a.byteswap()
+        t[op] = a.tobytes()[:nbytes]
+    return t
+
+
+def rf_encode(ops):
+    """op stream: token t = op << 5 | n. op 0..4: a run of n + 1 words (n == 31: u32 length follows); op 7: n + 1 words
+    of mixed ops, two per byte (low nibble first)"""
+    out = bytearray()
+    runs = []
+    i = 0
+    while i < len(ops):
+        j = i
+        while j < len(ops) and ops[j] == ops[i]:
+            j += 1
+        runs.append((ops[i], j - i))
+        i = j
+    mixed = []
+
+    def flush_mixed():
+        k = 0
+        while k < len(mixed):
+            chunk = mixed[k:k + 32]
+            out.append(0xE0 | (len(chunk) - 1))
+            for q in range(0, len(chunk), 2):
+                out.append(chunk[q] | ((chunk[q + 1] if q + 1 < len(chunk) else 0) << 4))
+            k += 32
+        del mixed[:]
+
+    for op, n in runs:
+        if n < 6:
+            mixed.extend([op] * n)
+            continue
+        flush_mixed()
+        if n <= 31:
+            out.append(op << 5 | (n - 1))
+        else:
+            out.append(op << 5 | 31)
+            out += struct.pack("<I", n)
+    flush_mixed()
+    return bytes(out)
+
+
+def rf_decode(stream, nwords):
+    ops = bytearray()
+    p = 0
+    while len(ops) < nwords:
+        t = stream[p]
+        p += 1
+        op, n = t >> 5, t & 31
+        if op == 7:
+            for q in range(n + 1):
+                b = stream[p + q // 2]
+                ops.append((b >> 4) if q & 1 else (b & 15))
+            p += (n + 2) // 2
+        elif n == 31:
+            cnt, = struct.unpack_from("<I", stream, p)
+            p += 4
+            ops += bytes([op]) * cnt
+        else:
+            ops += bytes([op]) * (n + 1)
+    assert len(ops) == nwords and p == len(stream), "op stream"
+    return ops
+
+
+def rf_code_side(repo, elf, objroot, files):
+    """(address, ROM file, name) of every data symbol of the code files that include extracted assets"""
+    incs = {}
+    for root, _, names in os.walk(os.path.join(repo, "src")):
+        for nm in names:
+            if not nm.endswith(".c"):
+                continue
+            path = os.path.join(root, nm)
+            txt = open(path, errors="replace").read()
+            m = re.findall(r'#include "assets/(boot|code|overlays)/([^/"]+)/[^"]*\.c"', txt)
+            if m:
+                kind, sub = m[0]
+                rf = "boot" if kind == "boot" else "code" if kind == "code" else sub
+                incs[os.path.relpath(path, repo)] = rf
+    # the gSequenceFontTable data, generated from the ROM's code file
+    incs["port/src_gen/sequence_font_table_data.c"] = "code"
+    groups, glob_syms = {}, {}
+    cur = None
+    for name, val, size, typ, bind, shndx in elf.symbols():
+        if typ == 4:  # STT_FILE
+            cur = groups.setdefault(name, {})
+        elif bind == 0 and cur is not None and typ == 1 and shndx:
+            cur[name] = (val, size)
+        elif bind in (1, 2) and typ == 1 and shndx:
+            glob_syms[name] = (val, size)
+    out, missing = [], []
+    for src, rf in sorted(incs.items()):
+        obj = os.path.join(objroot, os.path.splitext(src)[0] + ".o")
+        if rf not in files or not os.path.exists(obj):
+            missing.append(src)
+            continue
+        o = Elf32(open(obj, "rb").read())
+        local = groups.get(os.path.basename(src), {})
+        for name, val, size, typ, bind, shndx in o.symbols():
+            if typ != 1 or not shndx or shndx >= 0xFF00 or size < 8:
+                continue
+            got = local.get(name) if bind == 0 else glob_syms.get(name)
+            if got is None:
+                continue
+            out.append((got[0], got[1], rf, name, src))
+    return out, missing
+
+
+def rf_xml_offsets(repo):
+    """{(ROM file, asset name): offset in that file} from assets/xml (boot, code, overlays)"""
+    res = {}
+    for kind in ("boot", "code", "overlays"):
+        d = os.path.join(repo, "assets/xml", kind)
+        if not os.path.isdir(d):
+            continue
+        for nm in os.listdir(d):
+            txt = open(os.path.join(d, nm)).read()
+            for fbody in re.findall(r"<File\b(.*?)</File>", txt, re.S):
+                fname = re.search(r'Name="([^"]+)"', fbody).group(1)
+                for an, off in re.findall(r'Name="([^"]+)"[^>]*?Offset="(0x[0-9A-Fa-f]+)"', fbody):
+                    res[(fname, an)] = int(off, 16)
+    return res
+
+
+def romfree(argv):
+    if len(argv) != 3:
+        print("usage: gen_asset_tables.py --romfree IN.elf ROM-decompressed.z64 OUT.elf")
+        return 2
+    elf_path, rom_path, out_path = argv
+    data = bytearray(open(elf_path, "rb").read())
+    elf = Elf32(bytes(data))
+    rom = open(rom_path, "rb").read()
+    files = rf_rom_files(REPO)
+    syms = {}
+    for name, val, size, typ, bind, shndx in elf.symbols():
+        if shndx and bind in (1, 2):
+            syms[name] = (val, size)
+    if "gPortRomFree" not in syms:
+        print("romfree: gPortRomFree not in the ELF (3ds_main.c)")
+        return 1
+    hdr_addr = syms["gPortRomFree"][0]
+
+    # ---- the ranges: (destination, ROM offset, bytes, what) ----
+    ranges = []
+    segs = re.findall(r"port_seg_(\w+) \}", open(os.path.join(REPO, "port/src_gen/vrom_map.c")).read())
+    for seg in segs:
+        if "port_seg_" + seg not in syms or seg not in files:
+            print("romfree: segment %s not found" % seg)
+            return 1
+        st, en = files[seg]
+        ranges.append((syms["port_seg_" + seg][0], st, (en - st) & ~3, seg))
+    code_syms, missing = rf_code_side(REPO, elf, os.path.join(REPO, "build/3ds"), files)
+    if missing:
+        print("romfree: code files with assets not found built:", missing)
+    xml = rf_xml_offsets(REPO)
+    # the code file's data the decomp names by address (baseroms/<version>/config.yml variables: gSequenceFontTable)
+    cfg = os.path.join(REPO, "baseroms", VERSION, "config.yml")
+    code_vram = re.search(r"^_codeSegmentStart = (0x[0-9a-fA-F]+);", open(os.path.join(REPO, "port/rom_symbols.ld")).read(),
+                          re.M)
+    if os.path.exists(cfg) and code_vram:
+        for nm, va in re.findall(r"^\s+(\w+):\s*(0x[0-9A-Fa-f]+)\s*$", open(cfg).read(), re.M):
+            xml.setdefault(("code", nm), int(va, 16) - int(code_vram.group(1), 16))
+            if nm in syms and not any(c[3] == nm for c in code_syms):  # (tables compiled from the ROM's code file)
+                code_syms.append((syms[nm][0], syms[nm][1], "code", nm, "config.yml"))
+    taken = sorted((d, d + n) for d, _, n, _ in ranges)
+    import bisect
+
+    def overlaps(a, n):
+        i = bisect.bisect_right(taken, (a, 1 << 40))
+        return (i > 0 and taken[i - 1][1] > a) or (i < len(taken) and taken[i][0] < a + n)
+
+    found_xml = found_search = 0
+    for addr, size, rf, name, src in code_syms:
+        size &= ~3
+        if size < 8 or addr & 3 or overlaps(addr, size):
+            continue
+        sec = elf.section_of(addr, size)
+        if sec is None:
+            continue
+        native = bytes(data[sec["offset"] + addr - sec["addr"]:sec["offset"] + addr - sec["addr"] + size])
+        fst, fen = files[rf]
+        off = xml.get((rf, name))
+        if off is not None:
+            found_xml += 1
+            romoff = fst + off
+        else:
+            romoff = None
+            region = rom[fst:fen]
+            for op in RF_PREF:  # the ROM-order bytes this symbol would have under each op
+                x = RF_XOR[op]
+                if x and size % (x + 1):
+                    continue
+                want = bytes(native[k ^ x] for k in range(size))
+                p = region.find(want)
+                if p >= 0:
+                    romoff = fst + p
+                    break
+            if romoff is None:
+                continue
+            found_search += 1
+        ranges.append((addr, romoff, size, "%s:%s" % (src, name)))
+        bisect.insort(taken, (addr, addr + size))
+
+    # ---- per range: the ops, the zeroing, the restored words' CRC ----
+    rec = bytearray(struct.pack("<I", 0))
+    crc = 0
+    total = scrubbed = 0
+    nranges = 0
+    spans = []  # zeroed runs (address, bytes), for the recipe itself
+    readonly = []
+    maxbytes = 0
+    for dst, romoff, n, what in ranges:
+        sec = elf.section_of(dst, n)
+        if sec is None:
+            print("romfree: %s at %08x is not in the program's data" % (what, dst))
+            return 1
+        if not sec["flags"] & 1:  # SHF_WRITE: restored in place at boot
+            readonly.append(what)
+            continue
+        fo = sec["offset"] + dst - sec["addr"]
+        native = bytes(data[fo:fo + n])
+        ops = rf_word_ops(native, rf_transforms(rom, romoff, n))
+        nw = len(ops)
+        total += n
+        w = 0
+        while w < nw:  # runs of restored words: CRC in order, zeroed, kept as room for the recipe
+            if not ops[w]:
+                w += 1
+                continue
+            e = w
+            while e < nw and ops[e]:
+                e += 1
+            crc = zlib.crc32(native[w * 4:e * 4], crc)
+            data[fo + w * 4:fo + e * 4] = bytes((e - w) * 4)
+            scrubbed += (e - w) * 4
+            spans.append((dst + w * 4, (e - w) * 4))
+            w = e
+        stream = rf_encode(ops)
+        assert rf_decode(stream, nw) == ops
+        rec += struct.pack("<IIII", dst, romoff, nw, len(stream)) + stream
+        rec += b"\0" * (-len(rec) & 3)
+        nranges += 1
+        maxbytes = max(maxbytes, nw * 4)
+    struct.pack_into("<I", rec, 0, nranges)
+
+    # ---- the recipe into the largest zeroed runs ----
+    spans.sort(key=lambda s: -s[1])
+    use, room = [], 0
+    for a, n in spans:
+        if room >= len(rec) or len(use) == RF_MAX_SPANS:
+            break
+        n &= ~3
+        if n < 64:
+            break
+        use.append((a, n))
+        room += n
+    if room < len(rec):
+        print("romfree: no room for the recipe (%d bytes, %d free in %d runs)" % (len(rec), room, len(use)))
+        return 1
+    p = 0
+    final_spans = []
+    for a, n in use:
+        k = min(n, len(rec) - p)
+        if k <= 0:
+            break
+        sec = elf.section_of(a, k)
+        fo = sec["offset"] + a - sec["addr"]
+        data[fo:fo + k] = rec[p:p + k]
+        final_spans.append((a, k))
+        p += k
+    hdr = [RF_MAGIC, RF_VERSION, max(st + n for _, st, n, _ in ranges), crc, len(rec), maxbytes, len(final_spans), 0]
+    for a, k in final_spans:
+        hdr += [a, k]
+    hdr += [0] * (RF_HDR_WORDS - len(hdr))
+    sec = elf.section_of(hdr_addr, RF_HDR_WORDS * 4)
+    fo = sec["offset"] + hdr_addr - sec["addr"]
+    data[fo:fo + RF_HDR_WORDS * 4] = struct.pack("<%dI" % RF_HDR_WORDS, *hdr)
+
+    # ---- check: replay the recipe against the ROM, as the 3DS will ----
+    img = bytearray(data)
+    elf2 = Elf32(bytes(img))
+
+    def mem_off(a, n):
+        s = elf2.section_of(a, n)
+        return s["offset"] + a - s["addr"]
+
+    blob = bytearray()
+    for a, k in final_spans:
+        o = mem_off(a, k)
+        blob += img[o:o + k]
+    q = 0
+    cnt, = struct.unpack_from("<I", blob, q)
+    q += 4
+    crc2 = 0
+    for _ in range(cnt):
+        dst, romoff, nw, slen = struct.unpack_from("<IIII", blob, q)
+        q += 16
+        ops = rf_decode(bytes(blob[q:q + slen]), nw)
+        q += slen + (-slen & 3)
+        t = rf_transforms(rom, romoff, nw * 4)
+        o = mem_off(dst, nw * 4)
+        w = 0
+        while w < nw:
+            e = w
+            while e < nw and ops[e] == ops[w]:
+                e += 1
+            if ops[w]:
+                part = t[ops[w]][w * 4:e * 4]
+                img[o + w * 4:o + e * 4] = part
+                crc2 = zlib.crc32(part, crc2)
+            w = e
+    orig = open(elf_path, "rb").read()
+    if crc2 != crc:
+        print("romfree: CHECK FAILED (CRC %08x, expected %08x)" % (crc2, crc))
+        return 1
+    # after the replay only the header may differ from the original program
+    img[fo:fo + RF_HDR_WORDS * 4] = orig[fo:fo + RF_HDR_WORDS * 4]
+    if bytes(img) != orig:
+        print("romfree: CHECK FAILED (the replayed program differs from the original)")
+        return 1
+    open(out_path, "wb").write(data)
+    print("romfree: %d ranges (%d asset segments, %d code-side assets: %d by name, %d by content)"
+          % (nranges, len(segs), found_xml + found_search, found_xml, found_search))
+    print("romfree: %.1f MB of ROM data removed (%.1f%% of the ranges; the rest is pointers and other non-ROM words);"
+          " recipe %d KB in %d runs; check OK" % (scrubbed / 1048576.0, 100.0 * scrubbed / max(1, total),
+                                                  len(rec) // 1024, len(final_spans)))
+    if readonly:
+        print("romfree: WARNING: left in (read-only data): %s" % ", ".join(readonly))
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--romfree"]:
+        sys.exit(romfree(sys.argv[2:]))
     sys.exit(main())

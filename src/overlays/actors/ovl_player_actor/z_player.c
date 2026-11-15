@@ -4,6 +4,7 @@
  * Description: Player
  */
 #include "z64player.h"
+#include "port_minimap.h"
 
 #include "global.h"
 #include "z_en_item00.h"
@@ -69,6 +70,10 @@ s32 Player_StartFishing(PlayState* play);
 void func_8085B170(PlayState* play, Player* this);
 s32 func_8083A658(PlayState* play, Player* this);
 void Player_InitItemAction(PlayState* play, Player* this, PlayerItemAction itemAction);
+#ifdef __3DS__
+static s32 PortArrowCycle_SuppressR(Player* this, PlayState* play, s32 aiming);
+static void PortArrowCycle_Update(Player* this, PlayState* play);
+#endif
 
 void Player_UseItem(PlayState* play, Player* this, ItemId item);
 
@@ -3795,6 +3800,42 @@ EquipSlot func_8082FDC4(void) {
 /**
  * Handles the high level item usage and changing process based on the B and C buttons.
  */
+#ifdef __3DS__
+// PORT (2026-11-12): whether a D-pad item (port_minimap.h PORT_BTN_DPAD) may be used now: owned, and allowed by the same
+// rules z_parameter.c (Interface_UpdateButtonsPart2) applies to an item on a C button
+static s32 Player_PortDpadItemUsable(PlayState* play, Player* this, ItemId item) {
+    InterfaceContext* interfaceCtx = &play->interfaceCtx;
+
+    if ((item == ITEM_NONE) || (INV_CONTENT(item) != item) || (interfaceCtx->restrictions.all != 0)) {
+        return false;
+    }
+    // the game has switched the C buttons off (cutscenes, minigames, talking...)
+    if ((gSaveContext.buttonStatus[EQUIP_SLOT_C_LEFT] == BTN_DISABLED) &&
+        (gSaveContext.buttonStatus[EQUIP_SLOT_C_DOWN] == BTN_DISABLED) &&
+        (gSaveContext.buttonStatus[EQUIP_SLOT_C_RIGHT] == BTN_DISABLED)) {
+        return false;
+    }
+    if (!gPlayerFormItemRestrictions[GET_PLAYER_FORM][item] && !PORT_CHEAT_ON(CHEAT_UNRESTRICT)) {
+        return false;
+    }
+    if (this->currentMask == PLAYER_MASK_GIANT) {
+        return false;
+    }
+    if (item == ITEM_OCARINA_OF_TIME) {
+        return interfaceCtx->restrictions.tradeItems == 0;
+    }
+    if (interfaceCtx->restrictions.masks != 0) {
+        return false;
+    }
+    if (item == ITEM_MASK_FIERCE_DEITY) {
+        return (play->sceneId == SCENE_MITURIN_BS) || (play->sceneId == SCENE_HAKUGIN_BS) ||
+               (play->sceneId == SCENE_SEA_BS) || (play->sceneId == SCENE_INISIE_BS) ||
+               (play->sceneId == SCENE_LAST_BS) || PORT_CHEAT_ON(CHEAT_FIERCE);
+    }
+    return true;
+}
+#endif
+
 void Player_ProcessItemButtons(Player* this, PlayState* play) {
     if (this->stateFlags1 & (PLAYER_STATE1_CARRYING_ACTOR | PLAYER_STATE1_20000000)) {
         return;
@@ -3813,6 +3854,16 @@ void Player_ProcessItemButtons(Player* this, PlayState* play) {
         if (this->currentMask != PLAYER_MASK_NONE) {
             PlayerItemAction maskItemAction = GET_IA_FROM_MASK(this->currentMask);
             EquipSlot btn = func_8082FD0C(this, maskItemAction);
+#ifdef __3DS__
+            {
+                // PORT: the ZR mask slot (port_minimap.h) holds this mask: it is on a button, so it stays on
+                extern int gPortMaskSlotItem;
+                if ((btn <= EQUIP_SLOT_NONE) &&
+                    (Player_MaskIdToItemId(this->currentMask - 1) == (ItemId)gPortMaskSlotItem)) {
+                    btn = (this->unk_154 > EQUIP_SLOT_NONE) ? this->unk_154 : EQUIP_SLOT_C_LEFT;
+                }
+            }
+#endif
 
             if (btn <= EQUIP_SLOT_NONE) {
                 s32 maskIdMinusOne =
@@ -3845,6 +3896,39 @@ void Player_ProcessItemButtons(Player* this, PlayState* play) {
         ItemId item;
         EquipSlot i = func_8082FDC4();
 
+#ifdef __3DS__
+        {
+            // PORT: ZR (PORT_BTN_MASK, port_minimap.h) puts on / takes off the ZR slot's mask, as a fourth item button.
+            // Not where the game forbids masks (scene restrictions), or while it has the C buttons switched off.
+            extern int gPortMaskSlotItem;
+            ItemId slotItem = (ItemId)gPortMaskSlotItem;
+            if ((i >= EQUIP_SLOT_A) && CHECK_BTN_ALL(sPlayerControlInput->press.button, 0x0040) &&
+                (slotItem >= ITEM_MASK_DEKU) && (slotItem <= ITEM_MASK_GIANT) && (INV_CONTENT(slotItem) == slotItem) &&
+                (play->interfaceCtx.restrictions.masks == 0) && (play->interfaceCtx.restrictions.all == 0) &&
+                ((gSaveContext.buttonStatus[EQUIP_SLOT_C_LEFT] != BTN_DISABLED) ||
+                 (gSaveContext.buttonStatus[EQUIP_SLOT_C_DOWN] != BTN_DISABLED) ||
+                 (gSaveContext.buttonStatus[EQUIP_SLOT_C_RIGHT] != BTN_DISABLED))) {
+                this->heldItemButton = EQUIP_SLOT_C_LEFT;
+                Player_UseItem(play, this, slotItem);
+                return;
+            }
+        }
+        {
+            // PORT: the D-pad items (PORT_BTN_DPAD, port_minimap.h), as a fifth item button
+            static const ItemId sDpadItems[] = { ITEM_NONE,           ITEM_MASK_GORON, ITEM_MASK_DEKU,
+                                                 ITEM_MASK_ZORA,      ITEM_OCARINA_OF_TIME, ITEM_MASK_FIERCE_DEITY };
+            ItemId dpadItem = ((gPortDpadDir > 0) && (gPortDpadDir < (s32)ARRAY_COUNT(sDpadItems)))
+                                  ? sDpadItems[gPortDpadDir]
+                                  : ITEM_NONE;
+            if ((i >= EQUIP_SLOT_A) && CHECK_BTN_ALL(sPlayerControlInput->press.button, PORT_BTN_DPAD) &&
+                Player_PortDpadItemUsable(play, this, dpadItem)) {
+                this->heldItemButton = EQUIP_SLOT_C_LEFT;
+                Player_UseItem(play, this, dpadItem);
+                return;
+            }
+        }
+#endif
+
         i = ((i >= EQUIP_SLOT_A) && (this->transformation == PLAYER_FORM_FIERCE_DEITY) &&
              (this->heldItemAction != PLAYER_IA_SWORD_TWO_HANDED))
                 ? EQUIP_SLOT_B
@@ -3871,7 +3955,8 @@ void Player_ProcessItemButtons(Player* this, PlayState* play) {
 
                 if (bomb != NULL) {
                     bomb->timer = 0;
-                    this->blastMaskTimer = 310;
+                    /* PORT (2026-11-08): 2S2H Masks/BlastMaskCooldown (GAMEPLAY: No Blast Mask wait) */
+                    this->blastMaskTimer = PORT_ENH(ENH_BLAST_COOLDOWN) ? 0 : 310;
                 }
             }
         } else if (item == ITEM_F1) {
@@ -4142,7 +4227,7 @@ void func_80830B38(Player* this) {
 }
 
 s32 func_80830B88(PlayState* play, Player* this) {
-    if (CHECK_BTN_ALL(sPlayerControlInput->cur.button, BTN_R)) {
+    if (CHECK_BTN_ALL(sPlayerControlInput->cur.button, BTN_R) && !PortArrowCycle_SuppressR(this, play, false)) {
         if (!(this->stateFlags1 & (PLAYER_STATE1_400000 | PLAYER_STATE1_800000 | PLAYER_STATE1_20000000))) {
             if (!(this->stateFlags1 & PLAYER_STATE1_8000000) || ((this->currentBoots >= PLAYER_BOOTS_ZORA_UNDERWATER) &&
                                                                  (this->actor.bgCheckFlags & BGCHECKFLAG_GROUND))) {
@@ -6932,8 +7017,11 @@ void func_80836AD8(PlayState* play, Player* this) {
 }
 
 void func_80836B3C(PlayState* play, Player* this, f32 arg2) {
-    this->yaw = this->actor.shape.rot.y;
-    this->actor.world.rot.y = this->actor.shape.rot.y;
+    /* PORT (2026-11-08): 2S2H Restorations/SideRoll (GAMEPLAY: Side roll + crouch stab): the roll keeps its direction */
+    if (!PORT_ENH(ENH_SIDE_ROLL)) {
+        this->yaw = this->actor.shape.rot.y;
+        this->actor.world.rot.y = this->actor.shape.rot.y;
+    }
 
     if (this->transformation == PLAYER_FORM_GORON) {
         func_80836AD8(play, this);
@@ -7206,6 +7294,10 @@ s32 func_808373F8(PlayState* play, Player* this, u16 sfxId) {
             if (this->remainingHopsCounter == 0) {
                 this->stateFlags2 |= PLAYER_STATE2_80000;
                 func_808373A4(play, this);
+                /* PORT (2026-11-08): cheat, infinite Deku hops (2S2H Player/InfiniteDekuHopping) */
+                if (PORT_CHEAT_ON(CHEAT_DEKU_HOPS) && (gSaveContext.save.saveInfo.playerData.health != 0)) {
+                    this->remainingHopsCounter = 5;
+                }
             }
 
             return true;
@@ -8391,7 +8483,8 @@ s32 Player_ActionHandler_6(Player* this, PlayState* play) {
 }
 
 s32 Player_ActionHandler_11(Player* this, PlayState* play) {
-    if (CHECK_BTN_ALL(sPlayerControlInput->cur.button, BTN_R) && (this->unk_AA5 == PLAYER_UNKAA5_0) &&
+    if (CHECK_BTN_ALL(sPlayerControlInput->cur.button, BTN_R) && !PortArrowCycle_SuppressR(this, play, false) &&
+        (this->unk_AA5 == PLAYER_UNKAA5_0) &&
         (play->bButtonAmmoPlusOne == 0)) {
         if (Player_IsGoronOrDeku(this) ||
             ((((this->transformation == PLAYER_FORM_ZORA) &&
@@ -9513,7 +9606,8 @@ s32 Player_ActionHandler_2(Player* this, PlayState* play) {
                             this->yaw = this->actor.shape.rot.y = interactRangeActor->shape.rot.y;
 
                             func_8082DAD4(this);
-                            if ((giEntry->itemId != ITEM_NONE) && (giEntry->gid >= 0) &&
+                            /* PORT (2026-11-08): 2S2H Timesavers/FastChests (GAMEPLAY: Fast chests) */
+                            if (!PORT_ENH(ENH_FAST_CHESTS) && (giEntry->itemId != ITEM_NONE) && (giEntry->gid >= 0) &&
                                 (Item_CheckObtainability(giEntry->itemId) == ITEM_NONE)) {
                                 this->csId = chest->csId2;
                                 Player_Anim_PlayOnceAdjusted(play, this, this->ageProperties->openChestAnim);
@@ -10409,7 +10503,10 @@ s32 func_8083FD80(Player* this, PlayState* play) {
     if (!Player_IsGoronOrDeku(this) && (Player_GetMeleeWeaponHeld(this) != PLAYER_MELEEWEAPON_NONE) &&
         (this->transformation != PLAYER_FORM_ZORA) && sPlayerUseHeldItem) {
         //! Calling this function sets the meleeWeaponQuads' damage properties correctly, patching "Power Crouch Stab".
-        func_8083375C(this, PLAYER_MWA_STAB_1H);
+        /* PORT (2026-11-08): 2S2H Restorations/PowerCrouchStab (GAMEPLAY: Side roll + crouch stab) - not patched */
+        if (!PORT_ENH(ENH_SIDE_ROLL)) {
+            func_8083375C(this, PLAYER_MWA_STAB_1H);
+        }
         Player_Anim_PlayOnce(play, this, &gPlayerAnim_link_normal_defense_kiru);
         this->av1.actionVar1 = 1;
         this->meleeWeaponAnimation = PLAYER_MWA_STAB_1H;
@@ -10455,7 +10552,9 @@ bool func_8083FF30(PlayState* play, Player* this) {
 bool func_8083FFEC(PlayState* play, Player* this) {
     if (this->heldItemAction == PLAYER_IA_SWORD_RAZOR) {
         if (gSaveContext.save.saveInfo.playerData.swordHealth > 0) {
-            gSaveContext.save.saveInfo.playerData.swordHealth--;
+            if (!PORT_CHEAT_ON(CHEAT_RAZOR)) { /* PORT: cheat, the Razor Sword never dulls */
+                gSaveContext.save.saveInfo.playerData.swordHealth--;
+            }
             if (gSaveContext.save.saveInfo.playerData.swordHealth <= 0) {
                 Item_Give(play, ITEM_SWORD_KOKIRI);
                 Player_UseItem(play, this, ITEM_SWORD_KOKIRI);
@@ -11590,7 +11689,9 @@ void Player_UpdateInterface(PlayState* play, Player* this) {
         }
 
         if (doActionA != DO_ACTION_PUTAWAY) {
-            this->putAwayCooldownTimer = 20;
+            if (!gPortInstantPutaway) { /* PORT: 2S2H instant putaway */
+                this->putAwayCooldownTimer = 20;
+            }
         } else if (this->putAwayCooldownTimer != 0) {
             // Replace the "Put Away" Do Action label with a blank label while
             // the cooldown timer is counting down
@@ -12856,6 +12957,48 @@ void Player_UpdateCommon(Player* this, PlayState* play, Input* input) {
 
 Vec3f D_8085D41C = { 0.0f, 0.0f, -30.0f };
 
+#ifdef __3DS__
+/* PORT (2026-11-08): cheat, no clip (2S2H's port of SoH's debug noclip, Player_UpdateNoclip): while it is switched on
+ * Link floats through walls - the stick moves him the way the camera faces, A rises, B sinks, R goes faster - and the
+ * rest of his update is skipped. Not in cutscenes, messages, or when he is down. Returns true when it ran. */
+static s32 sPortNoclipOn;
+static s32 Player_PortNoclip(Player* this, PlayState* play) {
+    Input* input = &play->state.input[0];
+    f32 speed;
+    f32 mag;
+    s16 angle;
+
+    if (!PORT_CHEAT_ON(CHEAT_NOCLIP) || Player_InCsMode(play) || (play->msgCtx.msgMode != MSGMODE_NONE) ||
+        (gSaveContext.save.saveInfo.playerData.health == 0) || (this->stateFlags1 & PLAYER_STATE1_DEAD)) {
+        sPortNoclipOn = false;
+        return false;
+    }
+    if (!sPortNoclipOn) {
+        sPortNoclipOn = true;
+        Camera_ChangeMode(Play_GetCamera(play, CAM_ID_MAIN), CAM_MODE_ZORAFINZ);
+    }
+    speed = CHECK_BTN_ALL(input->cur.button, BTN_R) ? 50.0f : 15.0f;
+    if (CHECK_BTN_ALL(input->cur.button, BTN_A)) {
+        this->actor.world.pos.y += speed;
+    } else if (CHECK_BTN_ALL(input->cur.button, BTN_B)) {
+        this->actor.world.pos.y -= speed;
+    }
+    Lib_GetControlStickData(&mag, &angle, input);
+    if (mag > 10.0f) {
+        angle += Camera_GetInputDirYaw(GET_ACTIVE_CAM(play));
+        this->actor.world.pos.x += speed * (mag / 60.0f) * Math_SinS(angle);
+        this->actor.world.pos.z += speed * (mag / 60.0f) * Math_CosS(angle);
+        this->actor.shape.rot.y = this->actor.world.rot.y = this->yaw = angle;
+    }
+    Player_StopHorizontalMovement(this);
+    this->actor.gravity = 0.0f;
+    this->actor.velocity.x = this->actor.velocity.y = this->actor.velocity.z = 0.0f;
+    this->fallStartHeight = this->actor.world.pos.y; /* no fall damage when it goes off */
+    Math_Vec3f_Copy(&this->actor.home.pos, &this->actor.world.pos);
+    return true;
+}
+#endif
+
 void Player_Update(Actor* thisx, PlayState* play) {
     static Vec3f sDogSpawnPos;
     Player* this = (Player*)thisx;
@@ -12863,6 +13006,18 @@ void Player_Update(Actor* thisx, PlayState* play) {
     s32 pad;
     Input input;
     s32 pad2;
+
+#ifdef __3DS__
+    if (Player_PortNoclip(this, play)) {
+        play->actorCtx.isOverrideInputOn = false;
+        bzero(&play->actorCtx.overrideInput, sizeof(Input));
+        MREG(52) = this->actor.world.pos.x;
+        MREG(53) = this->actor.world.pos.y;
+        MREG(54) = this->actor.world.pos.z;
+        MREG(55) = this->actor.world.rot.y;
+        return;
+    }
+#endif
 
     this->stateFlags3 &= ~PLAYER_STATE3_10;
 
@@ -12919,7 +13074,129 @@ void Player_Update(Actor* thisx, PlayState* play) {
     MREG(53) = this->actor.world.pos.y;
     MREG(54) = this->actor.world.pos.z;
     MREG(55) = this->actor.world.rot.y;
+#ifdef __3DS__
+    PortArrowCycle_Update(this, play);
+    /* PORT: cheat, moon jump (2S2H MoonJump, there on N64 L, which the 3DS has no button for): hold L + R */
+    if (gPortCheats[CHEAT_MOONJUMP] && CHECK_BTN_ALL(CONTROLLER1(&play->state)->cur.button, BTN_Z | BTN_R)) {
+        this->actor.velocity.y = 6.34375f;
+        this->fallStartHeight = this->actor.world.pos.y; /* no fall damage after */
+    }
+    /* PORT (2026-11-08): 2S2H Songs/FasterSongPlayback (GAMEPLAY: Faster songs): a song played takes effect without its
+     * replay (not the Ballad of the Windfish, not while falling) */
+    if (PORT_ENH(ENH_FAST_SONGS) && (play->msgCtx.msgMode >= MSGMODE_SONG_PLAYED) &&
+        (play->msgCtx.msgMode <= MSGMODE_17) && !play->csCtx.state &&
+        ((play->msgCtx.ocarinaAction < OCARINA_ACTION_PROMPT_WIND_FISH_HUMAN) ||
+         (play->msgCtx.ocarinaAction > OCARINA_ACTION_PROMPT_WIND_FISH_DEKU)) &&
+        !(!(this->actor.bgCheckFlags & BGCHECKFLAG_GROUND) && (this->actor.velocity.y < 0.0f))) {
+        extern u8 sPlaybackState;
+        if (play->msgCtx.stateTimer > 1) {
+            play->msgCtx.stateTimer = 1;
+        }
+        play->msgCtx.ocarinaSongEffectActive = 0;
+        sPlaybackState = 0;
+    }
+#endif
 }
+
+#ifdef __3DS__
+/* PORT (2026-10-26): arrow cycling, from 2Ship2Harkinian (Enhancements/Equipment/ArrowCycle.cpp, without bomb arrows
+ * and the D-pad): while aiming the bow, R switches normal -> fire -> ice -> light arrows (the ones owned); the C button
+ * holding the bow takes the new arrow. Settings: GAMEPLAY tab, "Arrow cycle". */
+static s8 sPortArrowJustCycled;
+
+static s32 PortArrowCycle_Holding(Player* this) {
+    return (this->heldItemAction >= PLAYER_IA_BOW) && (this->heldItemAction <= PLAYER_IA_BOW_LIGHT);
+}
+
+static s32 PortArrowCycle_Aiming(Player* this) {
+    return PortArrowCycle_Holding(this) &&
+           ((this->unk_AA5 == PLAYER_UNKAA5_3) || (this->upperActionFunc == Player_UpperAction_7));
+}
+
+static s32 PortArrowCycle_Can(PlayState* play, Player* this) {
+    if (!gPortArrowCycle) {
+        return false;
+    }
+    if ((gSaveContext.minigameStatus == MINIGAME_STATUS_ACTIVE) &&
+        ((play->sceneId == SCENE_SYATEKI_MIZU) || (play->sceneId == SCENE_SYATEKI_MORI) ||
+         (play->sceneId == SCENE_20SICHITAI2))) {
+        return false;
+    }
+    return !gHorseIsMounted && (this->rideActor == NULL) && (INV_CONTENT(ITEM_BOW) == ITEM_BOW) &&
+           ((INV_CONTENT(ITEM_ARROW_FIRE) == ITEM_ARROW_FIRE) || (INV_CONTENT(ITEM_ARROW_ICE) == ITEM_ARROW_ICE) ||
+            (INV_CONTENT(ITEM_ARROW_LIGHT) == ITEM_ARROW_LIGHT));
+}
+
+/* R must not raise the shield / leave first person while it cycles arrows */
+static s32 PortArrowCycle_SuppressR(Player* this, PlayState* play, s32 aiming) {
+    Input* input = CONTROLLER1(&play->state);
+
+    if (!PortArrowCycle_Can(play, this) || !CHECK_BTN_ANY(input->cur.button, BTN_R)) {
+        return false;
+    }
+    if (aiming) {
+        return PortArrowCycle_Aiming(this) && (this->heldActor != NULL) && (this->heldActor->id == ACTOR_EN_ARROW);
+    }
+    return PortArrowCycle_Holding(this) && (sPortArrowJustCycled > 0);
+}
+
+static void PortArrowCycle_Update(Player* this, PlayState* play) {
+    static const s16 sMagicCost[] = { 4, 4, 8 };
+    static const u8 sItem[] = { ITEM_BOW, ITEM_BOW_FIRE, ITEM_BOW_ICE, ITEM_BOW_LIGHT };
+    static const u8 sOwn[] = { ITEM_BOW, ITEM_ARROW_FIRE, ITEM_ARROW_ICE, ITEM_ARROW_LIGHT };
+    static const PlayerItemAction sAction[] = { PLAYER_IA_BOW, PLAYER_IA_BOW_FIRE, PLAYER_IA_BOW_ICE,
+                                                PLAYER_IA_BOW_LIGHT };
+    Input* input = CONTROLLER1(&play->state);
+    s32 cur, next, i;
+
+    if (sPortArrowJustCycled > 0) {
+        sPortArrowJustCycled--;
+    }
+    if (!PortArrowCycle_Can(play, this)) {
+        return;
+    }
+    if ((this->stateFlags3 & PLAYER_STATE3_40) && (this->unk_ACE == 0)) {
+        return;
+    }
+    if (!PortArrowCycle_Aiming(this) || !CHECK_BTN_ANY(input->press.button, BTN_R) || (this->heldActor == NULL) ||
+        (this->heldActor->id != ACTOR_EN_ARROW)) {
+        return;
+    }
+    if (ARROW_IS_MAGICAL(this->heldActor->params)) { /* the held magic arrow's cost comes back */
+        Magic_Add(play, sMagicCost[ARROW_GET_MAGIC_FROM_TYPE(this->heldActor->params)]);
+    }
+    cur = this->heldItemAction - PLAYER_IA_BOW;
+    if ((cur < 0) || (cur > 3)) {
+        cur = 0;
+    }
+    next = 0;
+    for (i = 1; i < 4; i++) {
+        s32 t = (cur + i) % 4;
+
+        if ((t == 0) || (INV_CONTENT(sOwn[t]) == sOwn[t])) {
+            next = t;
+            break;
+        }
+    }
+    if (this->heldActor->child != NULL) {
+        Actor_Kill(this->heldActor->child);
+    }
+    Actor_Kill(this->heldActor);
+    Player_InitItemAction(play, this, sAction[next]);
+    for (i = EQUIP_SLOT_C_LEFT; i <= EQUIP_SLOT_C_RIGHT; i++) {
+        u8 it = BUTTON_ITEM_EQUIP(0, i);
+
+        if ((it == ITEM_BOW) || ((it >= ITEM_BOW_FIRE) && (it <= ITEM_BOW_LIGHT))) {
+            BUTTON_ITEM_EQUIP(0, i) = sItem[next];
+            C_SLOT_EQUIP(0, i) = SLOT_BOW;
+            Interface_LoadItemIcon(play, i);
+            gSaveContext.buttonStatus[i] = BTN_ENABLED;
+        }
+    }
+    Audio_PlaySfx(NA_SE_PL_CHANGE_ARMS);
+    sPortArrowJustCycled = 2;
+}
+#endif
 
 void Player_DrawGameplay(PlayState* play, Player* this, s32 lod, Gfx* cullDList,
                          OverrideLimbDrawFlex overrideLimbDraw) {
@@ -13263,19 +13540,29 @@ void Player_Destroy(Actor* thisx, PlayState* play) {
 s32 func_80847190(PlayState* play, Player* this, s32 arg2) {
     s32 pad;
     s16 var_s0;
+#ifdef __3DS__
+    // PORT (2026-11-14): Gameplay rows "Invert aim up/down" and "Invert aim left/right" (2Ship2Harkinian's Invert Aiming
+    // Y / X Axis): the stick's first-person look and aim turned around. (s32: -(-128) does not fit an s8.)
+    s32 aimStickY = PORT_ENH(ENH_INVERT_AIM_Y) ? -sPlayerControlInput->rel.stick_y : sPlayerControlInput->rel.stick_y;
+    s32 aimStickX = PORT_ENH(ENH_INVERT_AIM_X) ? -sPlayerControlInput->rel.stick_x : sPlayerControlInput->rel.stick_x;
+#define AIM_STICK_Y aimStickY
+#define AIM_STICK_X aimStickX
+#else
+#define AIM_STICK_Y sPlayerControlInput->rel.stick_y
+#define AIM_STICK_X sPlayerControlInput->rel.stick_x
+#endif
 
     if (!func_800B7128(this) && !func_8082EF20(this) && !arg2) {
-        var_s0 = sPlayerControlInput->rel.stick_y * 0xF0;
+        var_s0 = AIM_STICK_Y * 0xF0;
         Math_SmoothStepToS(&this->actor.focus.rot.x, var_s0, 0xE, 0xFA0, 0x1E);
 
-        var_s0 = sPlayerControlInput->rel.stick_x * -0x10;
+        var_s0 = AIM_STICK_X * -0x10;
         var_s0 = CLAMP(var_s0, -0xBB8, 0xBB8);
         this->actor.focus.rot.y += var_s0;
     } else {
         s16 temp3;
 
-        temp3 = ((sPlayerControlInput->rel.stick_y >= 0) ? 1 : -1) *
-                (s32)((1.0f - Math_CosS(sPlayerControlInput->rel.stick_y * 0xC8)) * 1500.0f);
+        temp3 = ((AIM_STICK_Y >= 0) ? 1 : -1) * (s32)((1.0f - Math_CosS(AIM_STICK_Y * 0xC8)) * 1500.0f);
         this->actor.focus.rot.x += temp3;
 
         if (this->stateFlags1 & PLAYER_STATE1_800000) {
@@ -13285,8 +13572,7 @@ s32 func_80847190(PlayState* play, Player* this, s32 arg2) {
         }
 
         var_s0 = this->actor.focus.rot.y - this->actor.shape.rot.y;
-        temp3 = ((sPlayerControlInput->rel.stick_x >= 0) ? 1 : -1) *
-                (s32)((1.0f - Math_CosS(sPlayerControlInput->rel.stick_x * 0xC8)) * -1500.0f);
+        temp3 = ((AIM_STICK_X >= 0) ? 1 : -1) * (s32)((1.0f - Math_CosS(AIM_STICK_X * 0xC8)) * -1500.0f);
         var_s0 += temp3;
 
         this->actor.focus.rot.y = CLAMP(var_s0, -0x4AAA, 0x4AAA) + this->actor.shape.rot.y;
@@ -13294,6 +13580,8 @@ s32 func_80847190(PlayState* play, Player* this, s32 arg2) {
 
     this->unk_AA6_rotFlags |= UNKAA6_ROT_FOCUS_Y;
 
+#undef AIM_STICK_Y
+#undef AIM_STICK_X
     return func_80832754(this, (play->bButtonAmmoPlusOne != 0) || func_800B7128(this) || func_8082EF20(this));
 }
 
@@ -15188,7 +15476,13 @@ void Player_Action_25(Player* this, PlayState* play) {
             s16 prevYaw = this->yaw;
 
             func_808378FC(play, this);
-            func_8083CBC4(this, speedTarget * 0.5f, yawTarget, 2.0f, 0.2f, 0.1f, 0x190);
+            /* PORT (2026-11-08): cheat, infinite Deku hops: the hops keep their speed (2S2H doubles the target, which
+             * Deku Link's air control halves) */
+            func_8083CBC4(this,
+                          speedTarget *
+                              ((PORT_CHEAT_ON(CHEAT_DEKU_HOPS) && (this->stateFlags3 & PLAYER_STATE3_200000)) ? 1.0f
+                                                                                                         : 0.5f),
+                          yawTarget, 2.0f, 0.2f, 0.1f, 0x190);
 
             if (this->skelAnime.animation == &gPlayerAnim_pn_attack) {
                 this->stateFlags2 |= (PLAYER_STATE2_20 | PLAYER_STATE2_40);
@@ -16025,11 +16319,13 @@ void Player_Action_43(Player* this, PlayState* play) {
             ((this->unk_AA5 == PLAYER_UNKAA5_3) &&
              (((Player_ItemToItemAction(this, Inventory_GetBtnBItem(play)) != this->heldItemAction) &&
                CHECK_BTN_ANY(sPlayerControlInput->press.button, BTN_B)) ||
-              CHECK_BTN_ANY(sPlayerControlInput->press.button, BTN_R | BTN_A) ||
+              (CHECK_BTN_ANY(sPlayerControlInput->press.button, BTN_R | BTN_A) &&
+               !PortArrowCycle_SuppressR(this, play, true)) ||
               Player_FriendlyLockOnOrParallel(this) || (!func_800B7128(this) && !func_8082EF20(this))))) ||
            ((this->unk_AA5 == PLAYER_UNKAA5_1) &&
             CHECK_BTN_ANY(sPlayerControlInput->press.button,
-                          BTN_CRIGHT | BTN_CLEFT | BTN_CDOWN | BTN_CUP | BTN_R | BTN_B | BTN_A))) ||
+                          BTN_CRIGHT | BTN_CLEFT | BTN_CDOWN | BTN_CUP | BTN_R | BTN_B | BTN_A) &&
+            !PortArrowCycle_SuppressR(this, play, true))) ||
           Player_ActionHandler_Talk(this, play)))) {
         func_80839ED0(this, play);
         Audio_PlaySfx(NA_SE_SY_CAMERA_ZOOM_UP);
@@ -16362,6 +16658,9 @@ void Player_Action_50(Player* this, PlayState* play) {
         var_fv1 = -1.0f;
     }
 
+    if (PORT_ENH(ENH_CLIMB_SPEED)) { /* PORT (2026-11-08): 2S2H Player/ClimbSpeed (GAMEPLAY: Faster climbing) */
+        var_fv1 *= 2.0f;
+    }
     this->skelAnime.playSpeed = var_fv1 * var_fv0;
 
     if (this->av2.actionVar2 >= 0) {
@@ -18621,6 +18920,22 @@ void Player_Action_86(Player* this, PlayState* play) {
     struct_8085D910* sp4C = D_8085D910;
     s32 sp48 = false;
 
+    /* PORT (2026-11-08): 2S2H Masks/FastTransformation (GAMEPLAY: Fast transformation): no cutscene, a flash, and the
+     * new form is loaded as at the end of it (z_player_lib.c func_8012301C waits for its object) */
+    if (PORT_ENH(ENH_FAST_TRANSFORM)) {
+        if (this->transformation == PLAYER_FORM_HUMAN) {
+            this->prevMask = PLAYER_MASK_NONE;
+        }
+        SET_WEEKEVENTREG(gPlayerTransformMaskFlags[GET_PLAYER_FORM]);
+        TransitionFade_SetColor(&play->unk_18E48, 0x000000);
+        R_TRANS_FADE_FLASH_ALPHA_STEP = -1;
+        Player_PlaySfx(this, NA_SE_SY_TRANSFORM_MASK_FLASH);
+        this->actor.update = func_8012301C;
+        this->actor.draw = NULL;
+        this->av1.actionVar1 = 0;
+        return;
+    }
+
     func_808323C0(this, play->playerCsIds[PLAYER_CS_ID_MASK_TRANSFORMATION]);
     sPlayerControlInput = play->state.input;
 
@@ -19504,7 +19819,8 @@ void Player_Action_96(Player* this, PlayState* play) {
 
             if ((this->stateFlags3 & PLAYER_STATE3_80000) &&
                 (!CHECK_BTN_ALL(sPlayerControlInput->cur.button, BTN_A) ||
-                 (gSaveContext.save.saveInfo.playerData.magic == 0) ||
+                 ((gSaveContext.save.saveInfo.playerData.magic == 0) &&
+                  !PORT_CHEAT_ON(CHEAT_GORON_MAGIC)) || /* PORT (2026-11-08): cheat, Goron roll, no magic */
                  ((this->av1.actionVar1 == 4) && (this->unk_B08 < 12.0f)))) {
                 if (Math_StepToS(&this->unk_B86[1], 0, 1)) {
                     this->stateFlags3 &= ~PLAYER_STATE3_80000;
@@ -19559,7 +19875,9 @@ void Player_Action_96(Player* this, PlayState* play) {
                 if (this->unk_B86[1] == 0) {
                     this->unk_B0C = 0.0f;
                     if (this->av1.actionVar1 >= 0x36) {
-                        Magic_Consume(play, 2, MAGIC_CONSUME_GORON_ZORA);
+                        if (!PORT_CHEAT_ON(CHEAT_GORON_MAGIC)) { /* PORT (2026-11-08): cheat, Goron roll, no magic */
+                            Magic_Consume(play, 2, MAGIC_CONSUME_GORON_ZORA);
+                        }
                         this->unk_B08 = 18.0f;
                         this->unk_B86[1] = 1;
                         this->stateFlags3 |= PLAYER_STATE3_80000;
@@ -19621,8 +19939,10 @@ void Player_Action_96(Player* this, PlayState* play) {
                     f32 var_fa1;
 
                     if (this->unk_B86[1] == 0) {
-                        if ((gSaveContext.magicState == MAGIC_STATE_IDLE) &&
-                            (gSaveContext.save.saveInfo.playerData.magic >= 2) && (this->av2.actionVar2 >= 0x36B0)) {
+                        if ((PORT_CHEAT_ON(CHEAT_GORON_MAGIC) || /* PORT (2026-11-08): cheat, Goron roll, no magic */
+                             ((gSaveContext.magicState == MAGIC_STATE_IDLE) &&
+                              (gSaveContext.save.saveInfo.playerData.magic >= 2))) &&
+                            (this->av2.actionVar2 >= 0x36B0)) {
                             this->av1.actionVar1++;
                             Actor_PlaySfx_Flagged2(&this->actor, NA_SE_PL_GORON_BALL_CHARGE - SFX_FLAG);
                         } else {

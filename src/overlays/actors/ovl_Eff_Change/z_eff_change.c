@@ -5,6 +5,8 @@
  */
 
 #include "z_eff_change.h"
+#include "port_minimap.h"
+#include "overlays/actors/ovl_En_Torch2/z_en_torch2.h"
 
 #define FLAGS (ACTOR_FLAG_UPDATE_CULLING_DISABLED)
 
@@ -43,6 +45,26 @@ static u8 D_80A4C920[] = {
 void EffChange_Init(Actor* thisx, PlayState* play) {
     EffChange* this = (EffChange*)thisx;
 
+#ifdef __3DS__
+    /* PORT (2026-11-08): 2S2H Songs/FasterSongPlayback (GAMEPLAY: Faster songs): the Elegy of Emptiness without its
+     * beam of light; the player's elegy action is moved on to where the beam would have ended */
+    if (PORT_ENH(ENH_FAST_SONGS)) {
+        Player* player = GET_PLAYER(play);
+
+        if (player->av2.actionVar2 < 10) {
+            player->av2.actionVar2 = 10;
+        } else if (player->av2.actionVar2 < 90) {
+            EnTorch2* torch2 = play->actorCtx.elegyShells[player->transformation];
+
+            if (torch2 != NULL) {
+                torch2->framesUntilNextState = 1;
+            }
+            player->av2.actionVar2 = 90;
+        }
+        Actor_Kill(&this->actor);
+        return;
+    }
+#endif
     this->actionFunc = func_80A4C5CC;
     this->actor.draw = EffChange_Draw;
     EffChange_SetColors(this, EFFCHANGE_GET_COLORS(thisx));

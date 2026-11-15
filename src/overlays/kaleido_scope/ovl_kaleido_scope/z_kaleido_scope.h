@@ -333,4 +333,9 @@ void KaleidoScope_UpdateInventoryEditor(PlayState* play);
 extern s16 gVtxPageMapWorldQuadsWidth[];
 extern s16 gVtxPageMapWorldQuadsHeight[];
 
+#ifdef __3DS__
+/* PORT (2026-11-08): the pause owl warp is on (z_kaleido_scope_NES.c, GAMEPLAY: Owl warp from pause) */
+s32 KaleidoScope_PortOwlWarpEnabled(PlayState* play);
+#endif
+
 #endif

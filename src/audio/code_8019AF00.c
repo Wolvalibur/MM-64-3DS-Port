@@ -1,4 +1,5 @@
 #include "global.h"
+#include "port_minimap.h"
 #include "z64voice.h"
 #include "attributes.h"
 
@@ -2455,7 +2456,9 @@ void AudioOcarina_CheckSongsWithoutMusicStaff(void) {
         // Loop through each of the songs
         for (songIndex = sFirstOcarinaSongIndex; songIndex < sLastOcarinaSongIndex; songIndex++) {
             // Checks to see if the song is available to be played
-            if ((u32)sOcarinaAvailableSongFlags & (1 << songIndex)) {
+            /* PORT (2026-11-08): 2S2H Songs/EnableSunsSong (GAMEPLAY: Sun's Song): Sun's Song is always recognised */
+            if (((u32)sOcarinaAvailableSongFlags & (1 << songIndex)) ||
+                (PORT_ENH(ENH_SUNS_SONG) && (songIndex == OCARINA_SONG_SUNS))) {
                 // Loops through all possible starting indices?
                 // Loops through the notes of the song?
                 for (j = 0, k = 0; (j < gOcarinaSongButtons[songIndex].numButtons) && (k == 0) &&

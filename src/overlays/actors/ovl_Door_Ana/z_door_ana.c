@@ -5,6 +5,7 @@
  */
 
 #include "z_door_ana.h"
+#include "port_minimap.h"
 #include "assets/objects/gameplay_field_keep/gameplay_field_keep.h"
 
 #define FLAGS (ACTOR_FLAG_UPDATE_DURING_OCARINA)
@@ -193,6 +194,24 @@ void DoorAna_Update(Actor* thisx, PlayState* play) {
     DoorAna* this = (DoorAna*)thisx;
 
     this->actionFunc(this, play);
+#ifdef __3DS__
+    /* PORT (2026-11-08): cheat, visible grottos (2S2H DifficultyOptions/HiddenGrottosVisibility): a hidden grotto
+     * gives off green sparkles */
+    if (PORT_CHEAT_ON(CHEAT_GROTTOS) && ((DOORANA_GET_TYPE(&this->actor) == DOORANA_TYPE_HIDDEN_STORMS) ||
+                                         (DOORANA_GET_TYPE(&this->actor) == DOORANA_TYPE_HIDDEN_BOMB)) &&
+        !(play->state.frames % 4)) {
+        static Vec3f sVelocity = { 0.0f, 3.0f, 0.0f };
+        static Vec3f sAccel = { 0.0f, 0.0f, 0.0f };
+        static Color_RGBA8 sPrimColor = { 255, 255, 255, 255 };
+        static Color_RGBA8 sEnvColor = { 0, 255, 64, 255 };
+        Vec3f pos;
+
+        pos.x = Rand_CenteredFloat(10.0f) + this->actor.world.pos.x;
+        pos.y = (Rand_ZeroOne() * 10.0f) + this->actor.world.pos.y;
+        pos.z = Rand_CenteredFloat(10.0f) + this->actor.world.pos.z;
+        EffectSsKirakira_SpawnDispersed(play, &pos, &sVelocity, &sAccel, &sPrimColor, &sEnvColor, 5000, 16);
+    }
+#endif
     this->actor.shape.rot.y = BINANG_ROT180(Camera_GetCamDirYaw(GET_ACTIVE_CAM(play)));
 }
 

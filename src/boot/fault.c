@@ -1125,6 +1125,16 @@ NORETURN void Fault_AddHungupAndCrashImpl(const char* exp1, const char* exp2) {
     FaultClient client;
     s32 pad;
 
+#ifdef __3DS__
+    {
+        // PORT (2026-11-12): the store to 0x11111111 below does not fault on the 3DS: it ran on into the next function,
+        // which called itself until the stack ran out (a 2DS crash at boot: SP far below the stack, no message). The
+        // error goes to sdmc:/3ds/mm/boot.log instead and the program stops there (3ds_main.c Port3ds_Fatal).
+        extern void Port3ds_Fatal(const char* exp1, const char* exp2, void* caller) __attribute__((noreturn));
+        Port3ds_Fatal(exp1, exp2, __builtin_return_address(0));
+    }
+#endif
+
     Fault_AddClient(&client, (void*)Fault_HangupFaultClient, (void*)exp1, (void*)exp2);
     *(u32*)0x11111111 = 0; // trigger an exception via unaligned memory access
 
@@ -1139,6 +1149,14 @@ NORETURN void Fault_AddHungupAndCrashImpl(const char* exp1, const char* exp2) {
  */
 NORETURN void Fault_AddHungupAndCrash(const char* file, s32 line) {
     char msg[0x100];
+
+#ifdef __3DS__
+    {
+        // PORT (2026-11-12): straight to the log - the port's sprintf leaves msg empty, and the message was lost
+        extern void Port3ds_FatalAt(const char* file, s32 line, void* caller) __attribute__((noreturn));
+        Port3ds_FatalAt(file, line, __builtin_return_address(0));
+    }
+#endif
 
     sprintf(msg, "HungUp %s:%d", file, line);
     Fault_AddHungupAndCrashImpl(msg, NULL);

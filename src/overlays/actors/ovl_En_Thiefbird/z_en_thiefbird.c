@@ -4,6 +4,7 @@
  * Description: Takkuri
  */
 #include "z_en_thiefbird.h"
+#include "port_minimap.h"
 #include "z_en_item00.h"
 #include "overlays/actors/ovl_En_Clear_Tag/z_en_clear_tag.h"
 
@@ -578,7 +579,8 @@ void func_80C1193C(EnThiefbird* this, PlayState* play) {
             if (!(this->collider.base.atFlags & AT_BOUNCED)) {
                 if (D_80C1392C && (CUR_UPG_VALUE(UPG_QUIVER) != 0) &&
                     ((STOLEN_ITEM_1 == STOLEN_ITEM_NONE) || (STOLEN_ITEM_2 == STOLEN_ITEM_NONE)) &&
-                    (Rand_ZeroOne() < 0.5f) && func_80C10B0C(this, play)) {
+                    /* PORT (2026-11-08): 2S2H DifficultyOptions/DisableTakkuriSteal (GAMEPLAY: Takkuri can't steal) */
+                    (Rand_ZeroOne() < 0.5f) && !PORT_ENH(ENH_NO_TAKKURI) && func_80C10B0C(this, play)) {
                     func_80C1242C(this);
                 } else if (func_80C10E98(play)) {
                     func_80C11338(this, play);

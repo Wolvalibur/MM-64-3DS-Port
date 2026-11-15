@@ -5,6 +5,7 @@
  */
 
 #include "z_obj_oshihiki.h"
+#include "port_minimap.h"
 #include "overlays/actors/ovl_Obj_Switch/z_obj_switch.h"
 #include "assets/objects/gameplay_dangeon_keep/gameplay_dangeon_keep.h"
 
@@ -478,7 +479,7 @@ void ObjOshihiki_OnActor(ObjOshihiki* this, PlayState* play) {
 void ObjOshihiki_SetupPush(ObjOshihiki* this, PlayState* play) {
     this->stateFlags |= PUSHBLOCK_SETUP_PUSH;
     this->dyna.actor.gravity = 0.0f;
-    this->pushSpeed = 2.0f;
+    this->pushSpeed = PORT_ENH(ENH_FAST_PUSH) ? 5.0f : 2.0f; /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
     this->actionFunc = ObjOshihiki_Push;
 }
 
@@ -516,7 +517,7 @@ void ObjOshihiki_Push(ObjOshihiki* this, PlayState* play) {
         this->dyna.pushForce = 0.0f;
         this->pushDist = 0.0f;
         this->pushSpeed = 0.0f;
-        this->timer = 10;
+        this->timer = PORT_ENH(ENH_FAST_PUSH) ? 2 : 10; /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
 
         if (this->floorBgIds[this->highestFloor] == BGCHECK_SCENE) {
             ObjOshihiki_SetupOnScene(this, play);

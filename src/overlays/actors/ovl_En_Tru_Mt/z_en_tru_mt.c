@@ -5,6 +5,7 @@
  */
 
 #include "z_en_tru_mt.h"
+#include "port_minimap.h"
 #include "overlays/actors/ovl_En_Jc_Mato/z_en_jc_mato.h"
 
 #define FLAGS                                                                                  \
@@ -337,7 +338,7 @@ void func_80B76924(EnTruMt* this) {
 void func_80B76980(EnTruMt* this, PlayState* play) {
     Player* player = GET_PLAYER(play);
 
-    if (gSaveContext.minigameHiddenScore >= 10) {
+    if ((gSaveContext.minigameHiddenScore >= 10) && !PORT_CHEAT_ON(CHEAT_MINIGAMES)) { /* PORT (2026-11-08): cheat, always win minigames (2S2H Minigames, at their easiest): Koume never falls */
         Message_StartTextbox(play, 0x87F, &this->actor);
         SET_EVENTINF(EVENTINF_36);
         SET_EVENTINF(EVENTINF_40);

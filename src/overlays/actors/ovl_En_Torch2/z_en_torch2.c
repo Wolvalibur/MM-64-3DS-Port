@@ -5,6 +5,7 @@
  */
 
 #include "z_en_torch2.h"
+#include "port_minimap.h"
 #include "assets/objects/gameplay_keep/gameplay_keep.h"
 
 #define FLAGS (ACTOR_FLAG_UPDATE_CULLING_DISABLED)
@@ -125,7 +126,8 @@ void EnTorch2_Update(Actor* thisx, PlayState* play) {
             CollisionCheck_SetOC(play, &play->colChkCtx, &this->collider.base);
             targetAlpha = 255;
         }
-        Math_StepToS(&this->alpha, targetAlpha, 8);
+        /* PORT (2026-11-08): 2S2H FasterSongPlayback (GAMEPLAY: Faster songs): the statue fades 3x as fast */
+        Math_StepToS(&this->alpha, targetAlpha, PORT_ENH(ENH_FAST_SONGS) ? 24 : 8);
     }
 }
 

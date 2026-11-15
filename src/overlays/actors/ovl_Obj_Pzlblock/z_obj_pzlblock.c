@@ -5,6 +5,7 @@
  */
 
 #include "z_obj_pzlblock.h"
+#include "port_minimap.h"
 #include "assets/objects/gameplay_dangeon_keep/gameplay_dangeon_keep.h"
 #include "assets/objects/object_secom_obj/object_secom_obj.h"
 
@@ -258,7 +259,7 @@ void func_809A3A74(ObjPzlblock* this, PlayState* play) {
     }
 
     if (sp20 != -1) {
-        if ((this->unk_16E[sp20] >= 11) && func_809A34E0(this, sp20) && func_809A35EC(this, sp20)) {
+        if ((PORT_ENH(ENH_FAST_PUSH) || (this->unk_16E[sp20] >= 11)) && func_809A34E0(this, sp20) && func_809A35EC(this, sp20)) { /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
             if (!func_809A33E0(this, play, (this->dyna.pushForce > 0.0f) ? 90 : 120)) {
                 func_809A376C(this, sp20);
                 func_809A3BA4(this);
@@ -277,7 +278,8 @@ void func_809A3BA4(ObjPzlblock* this) {
 }
 
 void func_809A3BC0(ObjPzlblock* this, PlayState* play) {
-    if (Math_StepToF(this->unk_164, this->unk_168, 2.3f)) {
+    if (Math_StepToF(this->unk_164, this->unk_168, 2.3f) ||
+        (PORT_ENH(ENH_FAST_PUSH) && Math_StepToF(this->unk_164, this->unk_168, 2.3f))) { /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
         Player* player = GET_PLAYER(play);
         s32 params = OBJPZLBLOCK_GET_ROTZ(&this->dyna.actor);
         s32 pad;

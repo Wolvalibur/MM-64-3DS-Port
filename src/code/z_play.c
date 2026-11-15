@@ -1,4 +1,5 @@
 #include "PR/ultratypes.h"
+#include "port_minimap.h"
 
 // Variables are put before most headers as a hacky way to bypass bss reordering
 s16 sTransitionFillTimer;
@@ -39,6 +40,10 @@ u8 sMotionBlurStatus;
 
 s32 gDbgCamEnabled = false;
 u8 D_801D0D54 = false;
+#ifdef __3DS__
+MtxF gPortPrevViewProjMtxF; /* the previous logic frame's viewProjectionMtxF (Play_Draw), for 60 fps culling */
+s32 gPortPrevViewProjOk;
+#endif
 
 typedef enum {
     /* 0 */ MOTION_BLUR_OFF,
@@ -51,6 +56,15 @@ void Play_DrawMotionBlur(PlayState* this) {
     s32 alpha;
     Gfx* gfx;
     Gfx* gfxHead;
+
+#ifdef __3DS__
+    // PORT: motion blur blends the previous frame, copied by the RDP into RAM (unk_18E64), over this one. Nothing
+    // copies frames into RAM here (the copy's target is off-screen and dropped), so the "previous frame" was stale
+    // memory: a blank 320-wide picture over cutscenes that use the effect (receiving the Ocarina of Time). Skipped.
+    (void)gfxCtx, (void)alpha, (void)gfx, (void)gfxHead;
+    sMotionBlurStatus = MOTION_BLUR_OFF;
+    return;
+#endif
 
     if (R_MOTION_BLUR_PRIORITY_ENABLED) {
         alpha = R_MOTION_BLUR_PRIORITY_ALPHA;
@@ -372,6 +386,10 @@ void Play_Destroy(GameState* thisx) {
     PlayState* this = (PlayState*)thisx;
     GraphicsContext* gfxCtx = this->state.gfxCtx;
 
+#ifdef __3DS__
+    PortDoubleTime_PlayDestroy(); /* PORT: the hour chosen with the Song of Double Time applies here */
+#endif
+
     if (sBombersNotebookOpen) {
         Sched_FlushTaskQueue();
         SysCfb_SetLoResMode();
@@ -609,6 +627,35 @@ void Play_UpdateTransition(PlayState* this) {
             }
 
             if (!D_801D0D54) {
+#ifdef __3DS__
+                /* PORT (2026-11-08): 2S2H Timesavers/FasterSceneTransitions (GAMEPLAY: Faster transitions): the fast
+                 * kind of each fade. Not from the opening scene (the file select), nor into grottos and graves (the
+                 * fall would hurt) */
+                if (PORT_ENH(ENH_FAST_TRANSITIONS) && (this->sceneId != SCENE_SPOT00) &&
+                    (this->sceneId != SCENE_KAKUSIANA) && (this->sceneId != SCENE_HAKASHITA)) {
+                    switch (this->transitionType) {
+                        case TRANS_TYPE_FADE_BLACK:
+                            this->transitionType = TRANS_TYPE_FADE_BLACK_FAST;
+                            break;
+                        case TRANS_TYPE_FADE_WHITE:
+                            this->transitionType = TRANS_TYPE_FADE_WHITE_FAST;
+                            break;
+                        case TRANS_TYPE_WIPE:
+                            this->transitionType = TRANS_TYPE_WIPE_FAST;
+                            break;
+                        case TRANS_TYPE_FILL_WHITE:
+                            this->transitionType = TRANS_TYPE_FILL_WHITE_FAST;
+                            break;
+                        case TRANS_TYPE_FADE_DYNAMIC:
+                            this->transitionType =
+                                gSaveContext.save.isNight ? TRANS_TYPE_FADE_BLACK_FAST : TRANS_TYPE_FADE_WHITE_FAST;
+                            break;
+                        default:
+                            break;
+                    }
+                    Play_SetupTransition(this, this->transitionType);
+                } else
+#endif
                 Play_SetupTransition(this, Play_ChooseDynamicTransition(this, this->transitionType));
             }
 
@@ -1062,9 +1109,18 @@ void Play_UpdateMain(PlayState* this) {
 
 void Play_Update(PlayState* this) {
 #ifdef __3DS__
+    {
+        extern void PortMaskSlot_Update(PlayState * play);
+        PortMaskSlot_Update(this); // PORT: the ZR mask slot (port_minimap.h)
+        PortEnh_Update(this);      // PORT: pause save, notebook, Song of Double Time (ultra_shims.c)
+    }
     if (IS_PAUSED(&this->pauseCtx) || this->pauseCtx.bombersNotebookOpen) {
         extern int gPortMenuInput;
         gPortMenuInput = 2; // PORT: in menus the D-pad navigates like the stick (port/src/3ds_main.c)
+    }
+    if (this->msgCtx.msgMode != MSGMODE_NONE) {
+        extern int gPortDpadAsC;
+        gPortDpadAsC = 2; // PORT: messages and the ocarina staff: the D-pad is the C buttons (port_minimap.h)
     }
 #endif
     if (!sBombersNotebookOpen) {
@@ -1117,6 +1173,11 @@ void Play_PostWorldDraw(PlayState* this) {
         GraphicsContext* gfxCtx = this->state.gfxCtx;
 
         sPlayVisFbufInstance->scale = gSaveContext.screenScale / 1000.0f;
+#ifdef __3DS__
+        if (sPlayVisFbufInstance->scale > 0.032f) {
+            return; /* PORT: shrunk by the renderer instead (Play_Draw); only the all-black end is drawn here */
+        }
+#endif
 
         OPEN_DISPS(gfxCtx);
 
@@ -1199,6 +1260,23 @@ void Play_DrawMain(PlayState* this) {
         this->projectionMtxFDiagonal.z = -this->viewProjectionMtxF.zz;
 
         SkinMatrix_MtxFMtxFMult(&this->viewProjectionMtxF, &this->billboardMtxF, &this->viewProjectionMtxF);
+#ifdef __3DS__
+        /* PORT (2026-11-15): 60 fps. The in-between frames look from cameras between the previous logic frame's and
+         * this one's, but the game skips what this frame's camera can't see (room pieces behind it, actors outside
+         * it): on a fast swing (Z-targeting behind Link) the ground and walls behind vanished on the in-between
+         * frames (user report). The previous frame's view-projection is kept so z_room.c / z_actor.c also draw what
+         * that camera saw. Only while in-between frames are shown and the camera did not cut (no blending then). */
+        {
+            extern int gPortInterpOn;
+            extern int gPortInterpCameraCut;
+            static MtxF sPortCurVP;
+            static s32 sPortHaveVP;
+            gPortPrevViewProjMtxF = sPortCurVP;
+            gPortPrevViewProjOk = sPortHaveVP && gPortInterpOn && !gPortInterpCameraCut;
+            sPortCurVP = this->viewProjectionMtxF;
+            sPortHaveVP = true;
+        }
+#endif
 
         this->billboardMtxF.mf[3][2] = this->billboardMtxF.mf[3][1] = this->billboardMtxF.mf[3][0] =
             this->billboardMtxF.mf[2][3] = this->billboardMtxF.mf[1][3] = this->billboardMtxF.mf[0][3] = 0.0f;
@@ -1261,11 +1339,33 @@ void Play_DrawMain(PlayState* this) {
 
         if (R_PAUSE_BG_PRERENDER_STATE == PAUSE_BG_PRERENDER_PROCESS) {
             Sched_FlushTaskQueue();
+#ifdef __3DS__
+            // PORT: the capture (Port3ds_CaptureFrame5551) is already antialiased (2x2 supersampled) and stored in the
+            // texture layout the CPU filter would read permuted: no filter, the restore draws it as it is
+            this->pauseBgPreRender.filterState = PRERENDER_FILTER_STATE_DONE;
+#else
             if (!gSaveContext.screenScaleFlag) {
                 PreRender_ApplyFiltersSlowlyInit(&this->pauseBgPreRender);
             }
+#endif
             R_PAUSE_BG_PRERENDER_STATE = PAUSE_BG_PRERENDER_READY;
             SREG(33) |= 1;
+#ifdef __3DS__
+            {
+                // PORT (2026-11-08): this frame drew nothing. The N64 doesn't clear its framebuffer here, so the screen
+                // kept an earlier picture; the 3DS starts every frame from black, and pausing flashed black between the
+                // last moving frame and the paused one (user video). The capture is already in fbufSave (the renderer
+                // takes it when it finishes the frame before, which it does before drawing this one), so this frame
+                // draws it already, as the next ones do.
+                Gfx* gfx = POLY_OPA_DISP;
+
+                PreRender_RestoreFramebuffer(&this->pauseBgPreRender, &gfx);
+                gSPDisplayList(gfx++, D_0E000000.syncSegments);
+                POLY_OPA_DISP = gfx;
+                sp25B = true;
+                goto PostWorldDraw;
+            }
+#endif
         } else {
             if (R_PAUSE_BG_PRERENDER_STATE == PAUSE_BG_PRERENDER_READY) {
                 Gfx* sp8C = POLY_OPA_DISP;
@@ -1409,11 +1509,21 @@ void Play_DrawMain(PlayState* this) {
                     this->pauseBgPreRender.cvgSave = NULL;
                 }
 
+#ifdef __3DS__
+                {
+                    // PORT: no RDP copy into RAM (the pause menu's background was black): the renderer reads this frame
+                    // back into fbufSave when it finishes (gfx_3ds.c), as in the OoT port. No coverage pass either: its
+                    // full-screen VISCVG fill would land on the screen.
+                    extern void Port3ds_CaptureFrame5551(void* dst);
+                    Port3ds_CaptureFrame5551(this->pauseBgPreRender.fbufSave);
+                }
+#else
                 PreRender_SaveFramebuffer(&this->pauseBgPreRender, &sp74);
 
                 if (this->pauseBgPreRender.cvgSave != NULL) {
                     PreRender_DrawCoverage(&this->pauseBgPreRender, &sp74);
                 }
+#endif
 
                 gSPEndDisplayList(sp74++);
                 Gfx_Close(sp70, sp74);
@@ -1450,6 +1560,18 @@ SkipPostWorldDraw:
 
 void Play_Draw(PlayState* this) {
     GraphicsContext* gfxCtx = this->state.gfxCtx;
+
+#ifdef __3DS__
+    /* PORT (2026-10-28): the end-of-day shrink is drawn by the renderer scaling the whole frame (gfx_pc.c sScreenScale):
+     * the scale goes at the start of the frame (the work list runs first), the N64's frame copy is skipped below */
+    if (gSaveContext.screenScaleFlag && (gSaveContext.screenScale < 1000.0f)) {
+        Gfx* g = gfxCtx->work.p++;
+        s32 permille = (gSaveContext.screenScale < 0.0f) ? 0 : (s32)gSaveContext.screenScale;
+
+        g->words.w0 = (u32)G_NOOP << 24;
+        g->words.w1 = 0x3D5C0000u | (u32)(permille & 0xFFFF);
+    }
+#endif
 
     {
         GraphicsContext* gfxCtx2 = this->state.gfxCtx;

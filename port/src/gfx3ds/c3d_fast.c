@@ -312,7 +312,10 @@ void C3Df_SetConfigs(const C3Df_Config* c0, const C3Df_Config* c1) {
     sSwState = 0;
 }
 
-int gPortFastSwitch = 1; /* settings fastswitch=0: plain citro3d switches */
+/* settings fastswitch=1 turns it on. PORT (2026-11-13): off - turning it back on (with the frame-start program switch
+ * moved inside the frame) garbled textures and the HUD on a New 3DS XL (user photos, Snowhead path). Plain citro3d
+ * switches are slower on an Old 3DS but draw correctly. */
+int gPortFastSwitch = 0;
 void C3Df_SelectConfig(int t) {
     C3Df_ContextHead* ctx = (C3Df_ContextHead*)(void*)__C3D_Context;
     bool clean = gPortFastSwitch && gpuCmdBuf != NULL && (ctx->flags & CFG_FLAGS) == 0;

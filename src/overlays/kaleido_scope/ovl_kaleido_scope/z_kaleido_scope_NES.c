@@ -5,6 +5,8 @@
  */
 
 #include "z_kaleido_scope.h"
+#include "port_minimap.h" /* PORT: cheats */
+#include "z64horse.h"
 
 #include "sys_cmpdma.h"
 #include "z64map.h"
@@ -2480,14 +2482,15 @@ void KaleidoScope_UpdateCursorSize(PlayState* play) {
 
             case PAUSE_MAP:
                 if (!sInDungeonScene) {
-                    if (IS_PAUSE_STATE_OWL_WARP(pauseCtx)) {
+                    /* PORT (2026-11-08): (or the pause owl warp, KaleidoScope_PortOwlWarpEnabled) */
+                    if (IS_PAUSE_STATE_OWL_WARP(pauseCtx) || KaleidoScope_PortOwlWarpEnabled(play)) {
                         pauseCtx->cursorX = sOwlWarpWorldMapCursorsX[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]];
                         pauseCtx->cursorY = sOwlWarpWorldMapCursorsY[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]];
                     } else {
                         pauseCtx->cursorX = sWorldMapCursorsX[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]];
                         pauseCtx->cursorY = sWorldMapCursorsY[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]];
                     }
-                    if (!IS_PAUSE_STATE_OWL_WARP(pauseCtx)) {
+                    if (!IS_PAUSE_STATE_OWL_WARP(pauseCtx) && !KaleidoScope_PortOwlWarpEnabled(play)) {
                         pauseCtx->cursorHeight = 10.0f;
                         pauseCtx->cursorWidth = 10.0f;
                     } else {
@@ -2813,6 +2816,227 @@ u16 sCursorPointsToOcarinaModes[] = {
     OCARINA_MODE_WARP_TO_STONE_TOWER,
 };
 
+#ifdef __3DS__
+/* PORT (2026-11-08): 2S2H Songs/PauseOwlWarp (GAMEPLAY: Owl warp from pause): with the Song of Soaring learned, the
+ * pause screen's world map shows the owl statues that have been activated in place of the regions, and A on one
+ * offers to warp there, as the song would (without its cutscene). Run at the end of KaleidoScope_Update, as 2S2H's
+ * OnKaleidoUpdate hook; z_kaleido_map.c draws the owls and leaves the cursor to this. */
+extern u16 sOwlWarpPauseItems[]; /* z_kaleido_map.c */
+
+static u16 sPortOwlWarpEntrances[OWL_WARP_MAX - 1] = {
+    ENTRANCE(GREAT_BAY_COAST, 11),         // OWL_WARP_GREAT_BAY_COAST
+    ENTRANCE(ZORA_CAPE, 6),                // OWL_WARP_ZORA_CAPE
+    ENTRANCE(SNOWHEAD, 3),                 // OWL_WARP_SNOWHEAD
+    ENTRANCE(MOUNTAIN_VILLAGE_WINTER, 8),  // OWL_WARP_MOUNTAIN_VILLAGE
+    ENTRANCE(SOUTH_CLOCK_TOWN, 9),         // OWL_WARP_CLOCK_TOWN
+    ENTRANCE(MILK_ROAD, 4),                // OWL_WARP_MILK_ROAD
+    ENTRANCE(WOODFALL, 4),                 // OWL_WARP_WOODFALL
+    ENTRANCE(SOUTHERN_SWAMP_POISONED, 10), // OWL_WARP_SOUTHERN_SWAMP
+    ENTRANCE(IKANA_CANYON, 4),             // OWL_WARP_IKANA_CANYON
+    ENTRANCE(STONE_TOWER, 3),              // OWL_WARP_STONE_TOWER
+};
+
+s32 KaleidoScope_PortOwlWarpEnabled(PlayState* play) {
+    return PORT_ENH(ENH_OWL_WARP) && !sInDungeonScene && CHECK_QUEST_ITEM(QUEST_SONG_SOARING) &&
+           (INV_CONTENT(ITEM_OCARINA_OF_TIME) == ITEM_OCARINA_OF_TIME) &&
+           (gSaveContext.save.saveInfo.playerData.owlActivationFlags != 0) &&
+           (play->pauseCtx.debugEditor == DEBUG_EDITOR_NONE) && (play->interfaceCtx.restrictions.songOfSoaring == 0);
+}
+
+static void PortOwlWarp_Confirming(PlayState* play, PauseContext* pauseCtx, Input* input) {
+    if (Message_ShouldAdvance(play)) {
+        if (play->msgCtx.choiceIndex == 0) { // Yes
+            Player* player = GET_PLAYER(play);
+
+            // Epona stays behind where she is (she would follow to the statue)
+            if (gHorseIsMounted && (player->stateFlags1 & PLAYER_STATE1_800000) && (player->rideActor != NULL)) {
+                if (CHECK_QUEST_ITEM(QUEST_SONG_EPONA)) {
+                    gSaveContext.save.saveInfo.horseData.sceneId = play->sceneId;
+                    gSaveContext.save.saveInfo.horseData.pos.x = player->rideActor->world.pos.x;
+                    gSaveContext.save.saveInfo.horseData.pos.y = player->rideActor->world.pos.y;
+                    gSaveContext.save.saveInfo.horseData.pos.z = player->rideActor->world.pos.z;
+                    gSaveContext.save.saveInfo.horseData.yaw = player->rideActor->shape.rot.y;
+                }
+                gHorseIsMounted = false;
+            }
+            CLEAR_EVENTINF(EVENTINF_41);
+            Interface_SetAButtonDoAction(play, DO_ACTION_NONE);
+            pauseCtx->state = PAUSE_STATE_UNPAUSE_SETUP;
+            sPauseMenuVerticalOffset = -6240.0f;
+            Audio_PlaySfx_PauseMenuOpenOrClose(SFX_PAUSE_MENU_CLOSE);
+            play->msgCtx.ocarinaMode = sCursorPointsToOcarinaModes[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]];
+            Audio_PlaySfx(NA_SE_SY_DECIDE);
+            Message_CloseTextbox(play);
+            play->nextEntrance = sPortOwlWarpEntrances[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]];
+            // the cleared swamp and the spring mountain village, as the Song of Soaring (EnTest7_WarpCsWarp)
+            if ((play->nextEntrance == ENTRANCE(SOUTHERN_SWAMP_POISONED, 10)) &&
+                CHECK_WEEKEVENTREG(WEEKEVENTREG_CLEARED_WOODFALL_TEMPLE)) {
+                play->nextEntrance = ENTRANCE(SOUTHERN_SWAMP_CLEARED, 10);
+            } else if ((play->nextEntrance == ENTRANCE(MOUNTAIN_VILLAGE_WINTER, 8)) &&
+                       CHECK_WEEKEVENTREG(WEEKEVENTREG_CLEARED_SNOWHEAD_TEMPLE)) {
+                play->nextEntrance = ENTRANCE(MOUNTAIN_VILLAGE_SPRING, 8);
+            }
+            play->transitionTrigger = TRANS_TRIGGER_START;
+            play->transitionType = TRANS_TYPE_FADE_WHITE;
+            gSaveContext.seqId = (u8)NA_BGM_DISABLED;
+            gSaveContext.ambienceId = AMBIENCE_ID_DISABLED;
+        } else { // No
+            Interface_SetAButtonDoAction(play, DO_ACTION_WARP);
+            Message_CloseTextbox(play);
+            Audio_PlaySfx(NA_SE_SY_MESSAGE_PASS);
+            pauseCtx->itemDescriptionOn = false;
+        }
+    } else if (CHECK_BTN_ALL(input->press.button, BTN_START) || CHECK_BTN_ALL(input->press.button, BTN_B)) {
+        Interface_SetAButtonDoAction(play, DO_ACTION_WARP);
+        Message_CloseTextbox(play);
+        Audio_PlaySfx(NA_SE_SY_MESSAGE_PASS);
+        pauseCtx->itemDescriptionOn = false;
+    }
+}
+
+/* KaleidoScope_UpdateWorldMapCursor over the owl statues instead of the regions */
+static void PortOwlWarp_UpdateCursor(PlayState* play, PauseContext* pauseCtx) {
+    InterfaceContext* interfaceCtx = &play->interfaceCtx;
+    s16 oldCursorPoint;
+    s32 goingLeft;
+    s32 goingRight;
+
+    if ((pauseCtx->state != PAUSE_STATE_MAIN) || (pauseCtx->mainState != PAUSE_MAIN_STATE_IDLE) ||
+        (pauseCtx->pageIndex != PAUSE_MAP)) {
+        return;
+    }
+    oldCursorPoint = pauseCtx->cursorPoint[PAUSE_WORLD_MAP];
+    goingLeft = pauseCtx->stickAdjX < -30;
+    goingRight = pauseCtx->stickAdjX > 30;
+
+    // Off the page-turn buttons
+    if ((pauseCtx->cursorSpecialPos == PAUSE_CURSOR_PAGE_LEFT) && goingRight) {
+        pauseCtx->cursorSpecialPos = 0;
+        pauseCtx->cursorPoint[PAUSE_WORLD_MAP] = REGION_NONE;
+        Audio_PlaySfx(NA_SE_SY_CURSOR);
+    } else if ((pauseCtx->cursorSpecialPos == PAUSE_CURSOR_PAGE_RIGHT) && goingLeft) {
+        pauseCtx->cursorSpecialPos = 0;
+        pauseCtx->cursorPoint[PAUSE_WORLD_MAP] = OWL_WARP_STONE_TOWER + 1;
+        Audio_PlaySfx(NA_SE_SY_CURSOR);
+    }
+
+    // The cursor's colour and A
+    if (pauseCtx->cursorSpecialPos == 0) {
+        pauseCtx->cursorColorSet = PAUSE_CURSOR_COLOR_SET_BLUE;
+        if (gSaveContext.buttonStatus[EQUIP_SLOT_A] == BTN_DISABLED) {
+            gSaveContext.buttonStatus[EQUIP_SLOT_A] = BTN_ENABLED;
+            gSaveContext.hudVisibility = HUD_VISIBILITY_IDLE;
+            Interface_SetHudVisibility(HUD_VISIBILITY_ALL);
+        }
+        if (interfaceCtx->aButtonDoActionDelayed != DO_ACTION_WARP) {
+            Interface_SetAButtonDoAction(play, DO_ACTION_WARP);
+        }
+        if (goingLeft || goingRight) {
+            pauseCtx->cursorShrinkRate = 4.0f;
+        }
+    } else {
+        pauseCtx->cursorColorSet = PAUSE_CURSOR_COLOR_SET_WHITE;
+        if (gSaveContext.buttonStatus[EQUIP_SLOT_A] != BTN_DISABLED) {
+            gSaveContext.buttonStatus[EQUIP_SLOT_A] = BTN_DISABLED;
+            gSaveContext.hudVisibility = HUD_VISIBILITY_IDLE;
+            Interface_SetHudVisibility(HUD_VISIBILITY_ALL);
+        }
+        if (interfaceCtx->aButtonDoActionDelayed != DO_ACTION_INFO) {
+            Interface_SetAButtonDoAction(play, DO_ACTION_INFO);
+        }
+    }
+
+    // Move along the activated statues, onto the page-turn buttons past the ends
+    if (pauseCtx->cursorSpecialPos == 0) {
+        if (goingRight) {
+            do {
+                pauseCtx->cursorPoint[PAUSE_WORLD_MAP]++;
+                if (pauseCtx->cursorPoint[PAUSE_WORLD_MAP] > OWL_WARP_STONE_TOWER) {
+                    KaleidoScope_MoveCursorToSpecialPos(play, PAUSE_CURSOR_PAGE_RIGHT);
+                    pauseCtx->cursorItem[PAUSE_MAP] = PAUSE_ITEM_NONE;
+                    break;
+                }
+            } while (!pauseCtx->worldMapPoints[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]]);
+        } else if (goingLeft) {
+            do {
+                pauseCtx->cursorPoint[PAUSE_WORLD_MAP]--;
+                if (pauseCtx->cursorPoint[PAUSE_WORLD_MAP] <= REGION_NONE) {
+                    KaleidoScope_MoveCursorToSpecialPos(play, PAUSE_CURSOR_PAGE_LEFT);
+                    pauseCtx->cursorItem[PAUSE_MAP] = PAUSE_ITEM_NONE;
+                    break;
+                }
+            } while (!pauseCtx->worldMapPoints[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]]);
+        }
+    }
+
+    // The name panel and the cursor's place
+    if ((pauseCtx->cursorSpecialPos == 0) && (pauseCtx->cursorPoint[PAUSE_WORLD_MAP] >= OWL_WARP_GREAT_BAY_COAST) &&
+        (pauseCtx->cursorPoint[PAUSE_WORLD_MAP] <= OWL_WARP_STONE_TOWER)) {
+        // (the offset from ITEM_MAP_POINT_GREAT_BAY is the order in map_name_static)
+        pauseCtx->cursorItem[PAUSE_MAP] =
+            sOwlWarpPauseItems[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]] - ITEM_MAP_POINT_GREAT_BAY;
+        pauseCtx->cursorSlot[PAUSE_MAP] = 31 + pauseCtx->cursorPoint[PAUSE_WORLD_MAP]; // (the cursor's vtxIndex)
+        if (!pauseCtx->worldMapPoints[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]]) {
+            pauseCtx->cursorItem[PAUSE_MAP] = PAUSE_ITEM_NONE;
+        }
+    }
+    if (oldCursorPoint != pauseCtx->cursorPoint[PAUSE_WORLD_MAP]) {
+        Audio_PlaySfx(NA_SE_SY_CURSOR);
+    }
+}
+
+static void PortOwlWarp_Update(PlayState* play) {
+    PauseContext* pauseCtx = &play->pauseCtx;
+    Input* input = &play->state.input[0];
+    s32 i;
+
+    // The map's points: the activated owl statues
+    for (i = OWL_WARP_STONE_TOWER; i >= OWL_WARP_GREAT_BAY_COAST; i--) {
+        pauseCtx->worldMapPoints[i] = (gSaveContext.save.saveInfo.playerData.owlActivationFlags >> i) & 1;
+    }
+    // Only the hidden 16th statue activated (the Song of Soaring's "entrance" warp): the regions visited
+    if (gSaveContext.save.saveInfo.playerData.owlActivationFlags == (1 << 15)) {
+        for (i = REGION_GREAT_BAY; i < REGION_STONE_TOWER; i++) {
+            if ((gSaveContext.save.saveInfo.regionsVisited >> i) & 1) {
+                pauseCtx->worldMapPoints[i] = true;
+            }
+        }
+        pauseCtx->worldMapPoints[OWL_WARP_GREAT_BAY_COAST] = true;
+    }
+    // The cursor starts on an activated statue
+    if ((pauseCtx->cursorPoint[PAUSE_WORLD_MAP] < OWL_WARP_GREAT_BAY_COAST) ||
+        (pauseCtx->cursorPoint[PAUSE_WORLD_MAP] > OWL_WARP_STONE_TOWER) ||
+        !pauseCtx->worldMapPoints[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]]) {
+        if (pauseCtx->cursorSpecialPos == 0) {
+            for (i = OWL_WARP_GREAT_BAY_COAST; i <= OWL_WARP_STONE_TOWER; i++) {
+                if (pauseCtx->worldMapPoints[i]) {
+                    pauseCtx->cursorPoint[PAUSE_WORLD_MAP] = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    if ((pauseCtx->state == PAUSE_STATE_MAIN) && (pauseCtx->pageIndex == PAUSE_MAP) && (pauseCtx->mapPageRoll == 0)) {
+        if (pauseCtx->itemDescriptionOn) {
+            PortOwlWarp_Confirming(play, pauseCtx, input);
+        } else {
+            PortOwlWarp_UpdateCursor(play, pauseCtx);
+            if (CHECK_BTN_ALL(input->press.button, BTN_A) && (pauseCtx->cursorSpecialPos == 0) &&
+                (pauseCtx->cursorPoint[PAUSE_WORLD_MAP] >= OWL_WARP_GREAT_BAY_COAST) &&
+                (pauseCtx->cursorPoint[PAUSE_WORLD_MAP] <= OWL_WARP_STONE_TOWER) &&
+                pauseCtx->worldMapPoints[pauseCtx->cursorPoint[PAUSE_WORLD_MAP]]) {
+                pauseCtx->itemDescriptionOn = true;
+                Audio_PlaySfx(NA_SE_SY_DECIDE);
+                // the pause screen's dark message box, "Warp here?"
+                Message_PauseMenu_ShowDescription(play, 0x1B93, 3);
+                play->msgCtx.choiceIndex = 0;
+            }
+        }
+    }
+}
+#endif
+
 void KaleidoScope_Update(PlayState* play) {
     static s16 sUnpausedHudVisibility = HUD_VISIBILITY_IDLE;
     static s16 sNextMainState = PAUSE_MAIN_STATE_IDLE;
@@ -2872,7 +3096,7 @@ void KaleidoScope_Update(PlayState* play) {
             gSegments[0x08] = OS_K0_TO_PHYSICAL(pauseCtx->iconItemSegment);
 
             for (itemId = 0; itemId <= ITEM_BOW_FIRE; itemId++) {
-                if (!gPlayerFormItemRestrictions[GET_PLAYER_FORM][(s32)itemId]) {
+                if (!gPlayerFormItemRestrictions[GET_PLAYER_FORM][(s32)itemId] && !PORT_CHEAT_ON(CHEAT_UNRESTRICT)) {
                     KaleidoScope_GrayOutTextureRGBA32(Lib_SegmentedToVirtual(gItemIcons[(s32)itemId]),
                                                       ICON_ITEM_TEX_WIDTH * ICON_ITEM_TEX_HEIGHT);
                 }
@@ -3745,4 +3969,9 @@ void KaleidoScope_Update(PlayState* play) {
     if ((pauseCtx->debugEditor == DEBUG_EDITOR_INVENTORY_INIT) || (pauseCtx->debugEditor == DEBUG_EDITOR_INVENTORY)) {
         KaleidoScope_UpdateInventoryEditor(play);
     }
+#ifdef __3DS__
+    if (KaleidoScope_PortOwlWarpEnabled(play)) {
+        PortOwlWarp_Update(play);
+    }
+#endif
 }

@@ -5,6 +5,7 @@
  */
 
 #include "z_en_look_nuts.h"
+#include "port_minimap.h"
 #include "overlays/effects/ovl_Effect_Ss_Solder_Srch_Ball/z_eff_ss_solder_srch_ball.h"
 
 #define FLAGS (ACTOR_FLAG_MINIMAP_ICON_ENABLED)
@@ -351,6 +352,15 @@ void EnLookNuts_Update(Actor* thisx, PlayState* play) {
                 if (gSaveContext.save.isNight) {
                     effectFlags = 0;
                 }
+#ifdef __3DS__
+                /* PORT: SETUP > Gameplay "Guard sight" (2S2H DekuGuardSearchBalls): 0 night only (original),
+                 * 1 never, 2 always */
+                if (gPortGuardSight == 1) {
+                    effectFlags = SOLDERSRCHBALL_INVISIBLE;
+                } else if (gPortGuardSight == 2) {
+                    effectFlags = 0;
+                }
+#endif
                 if (Player_GetMask(play) != PLAYER_MASK_STONE) {
                     EffectSsSolderSrchBall_Spawn(play, &effectPos, &effectVelocity, &gZeroVec3f, 50,
                                                  &this->isPlayerDetected, effectFlags);

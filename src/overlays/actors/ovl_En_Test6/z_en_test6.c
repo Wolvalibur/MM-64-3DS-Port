@@ -5,6 +5,7 @@
  */
 
 #include "z_en_test6.h"
+#include "port_minimap.h"
 
 #include "z64cutscene_commands.h"
 #include "zelda_arena.h"
@@ -400,6 +401,9 @@ void EnTest6_Destroy(Actor* thisx, PlayState* play2) {
     for (i = 0; i < ARRAY_COUNT(this->lights); i++) {
         LightContext_RemoveLight(play, &play->lightCtx, this->lights[i].node);
     }
+#ifdef __3DS__
+    PortDoubleTime_CutsceneDone(play2); /* BetterSongOfDoubleTime: reload the scene at the chosen hour */
+#endif
 }
 
 void EnTest6_StartCutscene(EnTest6* this, PlayState* play) {
@@ -921,6 +925,28 @@ void EnTest6_DoubleSoTCutscene(EnTest6* this, PlayState* play) {
 void EnTest6_Update(Actor* thisx, PlayState* play) {
     EnTest6* this = (EnTest6*)thisx;
 
+#ifdef __3DS__
+    /* PORT (2026-10-26): skip the Inverted / Double Song of Time cutscenes (2Ship2Harkinian SkipSoTCutscenes) */
+    if (gPortSkipCutscenes) {
+        if (this->actionFunc == EnTest6_DoubleSoTCutscene) {
+            this->actionFunc = EnTest6_StopDoubleSoTCutscene;
+            if (!PortDoubleTime_Pending() && (CURRENT_TIME > CLOCK_TIME(12, 0))) {
+                /* day -> night: respawned like the cutscene's last cue (SOTCS_CUEID_DOUBLE_END) */
+                Player* player = GET_PLAYER(play);
+
+                Play_SetRespawnData(play, RESPAWN_MODE_RETURN, gSaveContext.save.entrance, player->unk_3CE,
+                                    PLAYER_PARAMS(0xFF, PLAYER_START_MODE_B), &player->unk_3C0, player->unk_3CC);
+                play->transitionTrigger = TRANS_TRIGGER_START;
+                play->nextEntrance = gSaveContext.respawn[RESPAWN_MODE_RETURN].entrance;
+                play->transitionType = TRANS_TYPE_FADE_BLACK;
+                gSaveContext.respawnFlag = 2;
+                play->msgCtx.ocarinaMode = OCARINA_MODE_END;
+            }
+        } else if (this->actionFunc == EnTest6_InvertedSoTCutscene) {
+            this->actionFunc = EnTest6_StopInvertedSoTCutscene;
+        }
+    }
+#endif
     this->actionFunc(this, play);
 }
 

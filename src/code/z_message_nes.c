@@ -1,4 +1,5 @@
 #include "global.h"
+#include "port_minimap.h"
 #include "message_data_fmt_nes.h"
 #include "message_data_static.h"
 #include "attributes.h"
@@ -953,13 +954,16 @@ void Message_DrawTextNES(PlayState* play, Gfx** gfxP, u16 textDrawPos) {
     }
 
     if (msgCtx->textDelayTimer == 0) {
-        msgCtx->textDrawPos = i + 1;
+        msgCtx->textDrawPos = i + (gPortFastText ? 10 : 1); /* PORT: 2S2H fast text */
         msgCtx->textDelayTimer = 0;
         if (msgCtx->msgMode == MSGMODE_9) {
             msgCtx->msgMode = MSGMODE_TEXT_DISPLAYING;
         }
     } else {
         msgCtx->textDelayTimer--;
+        if (gPortFastText) {
+            msgCtx->textDelayTimer = 0;
+        }
     }
 
     *gfxP = gfx;

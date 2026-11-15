@@ -77,6 +77,7 @@ extern char __end__[];
 /* 4:3 content is centered in the target: N64 x -> x * RATIO_Y + GFX_PILLAR_X */
 #define GFX_PILLAR_X ((gfx_current_dimensions.width - SCREEN_WIDTH * RATIO_Y) / 2.0f)
 
+#include "port_minimap.h" /* (gPortEnh: the HUD size and CRT filter settings) */
 #define MAX_BUFFERED 256
 /* PORT (2026-09-25): F3DEX2 supports 7 directional lights + ambient (G_MAX_LIGHTS); sm64 used 2. OoT
  * sends up to 7 (e.g. torch-lit rooms): with 2, G_MW_NUMLIGHT made the lighting loop write
@@ -110,6 +111,7 @@ struct TextureHashmapNode {
     uint32_t pal_hash;   /* PORT: CI textures: hash of the palette colors they use (0 otherwise) */
     uint32_t line_size_bytes; /* PORT: the tile's row pitch: same bytes, different width = different texture */
     uint16_t width, height;   /* PORT: dimensions uploaded (texture coordinates are normalized to them) */
+    uint8_t rep;              /* PORT: CLAMP-with-mask repetition it was uploaded with (sImpRep), part of the key */
     
     uint32_t texture_id;
     uint8_t cms, cmt;
@@ -117,7 +119,7 @@ struct TextureHashmapNode {
 };
 static struct {
     struct TextureHashmapNode *hashmap[1024];
-    struct TextureHashmapNode pool[512];
+    struct TextureHashmapNode pool[1024]; /* PORT (2026-10-30): was 512, see gfx_start_frame */
     uint32_t pool_pos;
 } gfx_texture_cache;
 
@@ -130,6 +132,9 @@ static struct RSP {
     float P_matrix[4][4];
     
     Light_t current_lights[MAX_LIGHTS + 1];
+    /* PORT (2026-10-26): the same lights as loaded, all 16 bytes: a point light (F3DEX_GBI_PL PointLight_t, kc != 0)
+     * keeps its position's last component and kq past the 12 bytes of Light_t */
+    uint8_t current_lights_raw[MAX_LIGHTS + 1][16];
     float current_lights_coeffs[MAX_LIGHTS][3];
     float current_lookat_coeffs[2][3]; // lookat_x, lookat_y
     Light_t current_lookat[2]; /* the game's gSPLookAt (G_MV_LIGHT offsets 0 and 24) */
@@ -161,6 +166,9 @@ static struct RDP {
         uint32_t size_bytes;
         uint32_t line_size_bytes;            /* bytes loaded per row */
         uint32_t full_image_line_size_bytes; /* source row stride (== line for LOADBLOCK) */
+        uint32_t dxt;                        /* LOADBLOCK's dxt (0xFFFFFFFF: LOADTILE) */
+        uint32_t word_off;                   /* 64-bit words into that LOADBLOCK (a mip level inside it) */
+        uint32_t seq;                        /* load order */
     } loaded_texture[2];
     /* PORT (2026-09-25): the 8 RDP tile descriptors (was: only the render tile). Texture unit i draws
      * with tile first_tile + i (G_TEXTURE's tile), whose TMEM slot is tmem != 0 (libultraship's model:
@@ -171,6 +179,7 @@ static struct RDP {
         uint8_t palette; /* CI4 palette bank (G_SETTILE palette field) */
         uint8_t cms, cmt;
         uint8_t shifts, shiftt;
+        uint8_t masks, maskt; /* PORT (2026-10-26): kept for MIRROR | CLAMP (gfx_upload_texture) */
         uint16_t uls, ult, lrs, lrt; // U10.2
         uint32_t line_size_bytes;
         uint16_t tmem;
@@ -198,6 +207,11 @@ static struct RDP {
     uint32_t scissor_raw[4];  /* G_SETSCISSOR ulx, uly, lrx, lry (10.2) */
 } rdp;
 
+#ifdef __3DS__
+static float sDbgLinN; /* the draw log: the near distance this file last decided (0 = z-buffer) */
+int gPortDepthLinear = 1; /* 3ds_main.c Gameplay: the W-buffer (gfx_citro3d.c) or the original z-buffer */
+float gPortDepthP[3] = { -1.0f, -20.0f, -1.0f }; /* the latest perspective P[2][2], P[3][2], P[2][3] */
+#endif
 static struct RenderingState {
     bool depth_test;
     bool depth_mask;
@@ -263,12 +277,24 @@ static uint32_t gPortPerfTexImports;
 #endif
 static void gfx_flush_impl(void);
 static void import_texture_impl(int unit, int tile_index);
+static uint32_t sTexLoadSeq; /* LOADBLOCK / LOADTILE order (rdp.loaded_texture[].seq) */
 static float gfx_adjust_x_for_aspect_ratio(float x);
+static float gfx_hud_shift_px(void); /* widescreen HUD anchoring (see gPortHudEdges) */
+static float hud_scale(void);        /* the HUD size setting (see gPortHudEdges) */
+static int hud_left(void), hud_top(void);
+static float hud_side(void);
+struct XYWidthHeight;
+static void hud_scale_box(struct XYWidthHeight* b);
 /* GPU vertex path (gpu_vtx=1): the batch's matrix palette, flushed with the draw (see "GPU vertex path") */
 extern int gPortGpuVtx;
 extern void gfx_citro3d_draw_indexed(void);
 #ifdef __3DS__
 static int sInRoomDl;
+static int sRoomEntryN; /* room mesh entries drawn this frame (gfx_citro3d.c: layers in one plane resolve by draw order) */
+/* PORT (2026-11-07): inside an entry Room_DrawCullable sorted by distance (z_room.c tags 0x3D5E5202 / 03): its own
+ * materials keep their order in a short range of their own (40..48: 0.64 units at most), every entry starting from the
+ * same place, so the order of the entries themselves (nearest first) never decides depth */
+static int sRoomSorted, sRoomSortedLayer;
 u64 gPortPerfRoomTicks;
 #ifdef PORT_ACTOR_PROF
 u64 gPortActorTicks[512];
@@ -287,10 +313,20 @@ static void gfx_flush(void) {
     PROF_POP();
     gPortPerfFlush += PERF_T() - t0;
 }
+#ifdef __3DS__
+static int sCropSlot = -1;   /* import_texture_impl: the slot whose size it cut to the tile's row mask */
+static uint32_t sCropOrig;   /* and its size before */
+#endif
 static void import_texture(int unit, int tile_index) {
     uint64_t t0 = PERF_T();
     PROF_PUSH(PROF_TEX);
     import_texture_impl(unit, tile_index);
+#ifdef __3DS__
+    if (sCropSlot >= 0) {
+        rdp.loaded_texture[sCropSlot].size_bytes = sCropOrig;
+        sCropSlot = -1;
+    }
+#endif
     PROF_POP();
     gPortPerfTex += PERF_T() - t0;
     gPortPerfTexImports++;
@@ -304,14 +340,26 @@ static void import_texture(int unit, int tile_index) {
  * their full-rect clears. Only draws whose color image is a real framebuffer (SysCfb) reach
  * the screen; other targets are dropped until real render-to-texture exists (roadmap G10). */
 extern void* gFramebuffers[2]; /* MM: sys_cfb.c (OoT port: sSysCfbFbPtr) */
+/* PORT (2026-10-26): the Bomber's Notebook switches the game to a 576x454 hi-res framebuffer (SysCfb_SetHiResMode);
+ * its screen coordinates are scaled to the 320x240 space the renderer maps (viewport, scissor, rectangles) */
+#define PORT_HIRES_W 576
+#define PORT_HIRES_H 454
+static inline int gfx_cimg_is_hires(void) {
+    uintptr_t a = (uintptr_t)rdp.color_image_address;
+    return rdp.color_image_width == PORT_HIRES_W && (a == (uintptr_t)gFramebuffers[0] || a == (uintptr_t)gFramebuffers[1]);
+}
 static inline int gfx_cimg_is_screen(void) {
     uintptr_t a = (uintptr_t)rdp.color_image_address;
     /* a framebuffer address with another width is a different image (Player_DrawPause's 64-wide one) */
     return a == 0 || ((a == (uintptr_t)gFramebuffers[0] || a == (uintptr_t)gFramebuffers[1]) &&
-                      (rdp.color_image_width == 0 || rdp.color_image_width == SCREEN_WIDTH));
+                      (rdp.color_image_width == 0 || rdp.color_image_width == SCREEN_WIDTH ||
+                       rdp.color_image_width == PORT_HIRES_W));
 }
 #else
 static inline int gfx_cimg_is_screen(void) { return 1; }
+static inline int gfx_cimg_is_hires(void) { return 0; }
+#define PORT_HIRES_W 576
+#define PORT_HIRES_H 454
 #endif
 
 #ifdef __3DS__
@@ -619,7 +667,9 @@ static void gfx_texture_cache_apply_queued(void) {
     sInvOverflow = 0;
     LightLock_Unlock(&sInvLock);
 }
+static void gfx_logical_unmark(const void* start, uint32_t size); /* (archive textures, see gfx_src_swizzle) */
 void gfx_texture_cache_invalidate_range(const void* start, uint32_t size) {
+    gfx_logical_unmark(start, size); /* the memory is reused: no longer the archive data marked there */
     if (gPortRenderThreaded && !Port3ds_OnRenderThread()) {
         LightLock_Lock(&sInvLock);
         if (sInvN < (int)(sizeof(sInvQ) / sizeof(sInvQ[0]))) {
@@ -654,6 +704,43 @@ static int sTlutHashValid;
 static const struct TileDesc* sImpTile; /* tile of the texture being imported (import_texture) */
 static struct TextureHashmapNode* sImpNode; /* its cache node */
 
+/* PORT (2026-10-26): CLAMP with a mask. The RDP clamps a coordinate to the tile's size and then wraps (or, with MIRROR,
+ * mirrors) it within the mask's 2^n texels, so a tile larger than its texture repeats the texture up to the tile's edge
+ * and only clamps beyond it. The GPU's clamp stops at the texture's edge: the stretched streaks on the moon's lower half
+ * (its far side: a 64-texel texture clamped over a 128-texel tile), the scarecrow's arms (MIRROR | CLAMP over two
+ * periods) and the telescope's circle (a mirrored quarter). Such a texture is uploaded already repeated (mirrored for
+ * MIRROR) as many times as the tile spans, and clamped from there. sImpRep: copies - 1 per axis (3 bits each), the
+ * MIRROR bits; part of the texture cache's key (the same texture is also drawn plainly). */
+static uint8_t sImpRep;
+static uint8_t sRepBuf[128 * 128 * 4] __attribute__((aligned(32)));
+static uint32_t tile_repeats(uint8_t cm, uint8_t mask, uint16_t ul, uint16_t lr, uint32_t size) {
+    uint32_t range = (uint32_t)((lr - ul) / 4 + 1), n;
+    if (!(cm & G_TX_CLAMP) || mask == 0 || size == 0 || size != (1u << mask) || lr < ul || range <= size) {
+        return 1;
+    }
+    n = (range + size - 1) / size;
+    return n > 8 ? 8 : n;
+}
+static void imp_rep_compute(uint32_t line, uint32_t size_bytes, uint8_t siz) {
+    uint32_t w, h, ns, nt;
+    sImpRep = 0;
+#ifdef __3DS__
+    if (line == 0) return;
+    w = siz == G_IM_SIZ_32b ? line / 2 : line * 8 / (siz == G_IM_SIZ_4b ? 4 : siz == G_IM_SIZ_8b ? 8 : 16);
+    h = siz == G_IM_SIZ_32b ? size_bytes / 2 / line : size_bytes / line;
+    ns = tile_repeats(sImpTile->cms, sImpTile->masks, sImpTile->uls, sImpTile->lrs, w);
+    nt = tile_repeats(sImpTile->cmt, sImpTile->maskt, sImpTile->ult, sImpTile->lrt, h);
+    while (w * ns * h * nt * 4 > sizeof(sRepBuf) && (ns > 1 || nt > 1)) {
+        if (ns >= nt && ns > 1) ns--; else nt--;
+    }
+    if (ns > 1 || nt > 1) {
+        sImpRep = (uint8_t)((ns - 1) | ((nt - 1) << 3) | ((sImpTile->cms & G_TX_MIRROR) ? 0x40 : 0) |
+                            ((sImpTile->cmt & G_TX_MIRROR) ? 0x80 : 0));
+    }
+#else
+    (void)line, (void)size_bytes, (void)siz, (void)w, (void)h, (void)ns, (void)nt;
+#endif
+}
 static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, const uint8_t *orig_addr, uint32_t fmt, uint32_t siz, uint32_t size_bytes) {
     uint32_t pal_hash = gfx_ci_palette_hash(fmt, siz);
     size_t hash = (uintptr_t)orig_addr;
@@ -661,7 +748,8 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
     struct TextureHashmapNode **node = &gfx_texture_cache.hashmap[hash];
     while (*node != NULL && *node - gfx_texture_cache.pool < gfx_texture_cache.pool_pos) {
         if ((*node)->texture_addr == orig_addr && (*node)->fmt == fmt && (*node)->siz == siz && (*node)->size_bytes == size_bytes &&
-            (*node)->pal_hash == pal_hash && (*node)->line_size_bytes == sImpTile->line_size_bytes) {
+            (*node)->pal_hash == pal_hash && (*node)->line_size_bytes == sImpTile->line_size_bytes &&
+            (*node)->rep == sImpRep) {
             gfx_rapi->select_texture(tile, (*node)->texture_id);
             *n = *node;
             return true;
@@ -671,6 +759,7 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
     if (gfx_texture_cache.pool_pos == sizeof(gfx_texture_cache.pool) / sizeof(struct TextureHashmapNode)) {
         // Pool is full. We just invalidate everything and start over.
         gfx_texture_cache.pool_pos = 0;
+        memset(gfx_texture_cache.hashmap, 0, sizeof(gfx_texture_cache.hashmap));
 #ifdef __3DS__
         {
             static int sWraps;
@@ -695,6 +784,7 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
     (*node)->next = NULL;
     (*node)->texture_addr = orig_addr;
     (*node)->pal_hash = pal_hash;
+    (*node)->rep = sImpRep;
     (*node)->line_size_bytes = sImpTile->line_size_bytes;
     (*node)->width = (*node)->height = 0;
     (*node)->fmt = fmt;
@@ -790,10 +880,39 @@ static void mesh_write(void) {
 static int sMeshRedecode; /* import_texture_impl decodes for the capture only: no cache lookup, no upload */
 #endif
 static void gfx_upload_texture(uint8_t* buf, uint32_t width, uint32_t height) {
+#ifdef __3DS__
+    {
+        uint32_t ns = (sImpRep & 7) + 1, nt = ((sImpRep >> 3) & 7) + 1, w2 = width * ns, h2 = height * nt, x, y;
+        int ms = (sImpRep >> 6) & 1, mt = (sImpRep >> 7) & 1;
+        if ((ns > 1 || nt > 1) && w2 * h2 * 4 <= sizeof(sRepBuf)) {
+            const uint32_t* src = (const uint32_t*)(const void*)buf;
+            uint32_t* dst = (uint32_t*)(void*)sRepBuf;
+            for (y = 0; y < h2; y++) {
+                uint32_t py = y / height, sy = y % height;
+                if (mt && (py & 1)) sy = height - 1 - sy;
+                for (x = 0; x < w2; x++) {
+                    uint32_t px = x / width, sx = x % width;
+                    if (ms && (px & 1)) sx = width - 1 - sx;
+                    dst[y * w2 + x] = src[sy * width + sx];
+                }
+            }
+            buf = sRepBuf;
+            width = w2;
+            height = h2;
+        }
+    }
+#endif
 #ifdef PORT_ICONGEN
     if (sMeshRedecode) {
         mesh_keep_texture(sImpNode->texture_id, buf, width, height);
         return;
+    }
+#endif
+#ifdef __3DS__
+    { /* PORT (2026-10-26): how the 3DS backend pads a texture to its power-of-two size (gfx_citro3d.c): clamped
+       * axes repeat their last texel, wrapped ones repeat the texture (G_TX_CLAMP: set_tile also clamps NOMASK) */
+        extern int gPortTexPadClamp;
+        gPortTexPadClamp = ((sImpTile->cms & G_TX_CLAMP) ? 1 : 0) | ((sImpTile->cmt & G_TX_CLAMP) ? 2 : 0);
     }
 #endif
     gfx_rapi->upload_texture(buf, width, height);
@@ -966,11 +1085,119 @@ static void import_texture_rgba32(int tile) {
  * textures only 4-byte aligned in the ROM) keep it at address ^ 3. Reading those with ^ 7 scrambled
  * their palettes and texels (striped hair, camouflage skin). Table: port/src_gen/u32_asset_ranges.c. */
 #ifdef __3DS__
+/* PORT (2026-10-26): textures in LOGICAL byte order. Archive files (*_yar, map_i/map_name/item_name_static, the
+ * schedule archive) stay ROM data and are unpacked at run time by sys_cmpdma.c (Yaz0, byte by byte), so their bytes
+ * are in N64 order, not at ^ 7: item icons on the B/C buttons, the pause screens' items, equipment, names and the
+ * minimap came out scrambled (the 3DS_PORT_PLAN "archive textures" item; user report: sword and shield icons).
+ * CmpDma marks what it unpacks (gfx_mark_logical_texture); a DMA into that memory, which reuses it, unmarks it
+ * (gfx_texture_cache_invalidate_range). Written by the game thread, read by the render thread: an entry is filled
+ * before it is published and emptied in one store. */
+#define LOGICAL_MAX 128
+static volatile uintptr_t sLogicalS[LOGICAL_MAX], sLogicalE[LOGICAL_MAX];
+/* PORT (2026-10-26): when the table is full the entry drawn from longest ago is replaced, not the oldest marked one.
+ * Every ROM DMA marks its buffer, so after a few area changes the round robin dropped the C-button icons' entry
+ * (marked once at boot, drawn every frame): the icons were read with ^ 7 again - RGBA bytes reversed, a see-through
+ * yellow ocarina until restart (user report). */
+static volatile uint32_t sLogicalHit[LOGICAL_MAX];
+static volatile uint32_t sLogicalClock;
+/* PORT (2026-10-26): only the part that was reused is unmarked. Touching ranges merge into one entry (the four B/C icon
+ * slots, and whatever the game allocated next to them), and a DMA into any neighbour dropped the whole entry: a C button's
+ * icon was read with ^ 7 again - the ocarina a see-through gold, the Deku Mask pink and half gone (user report: always the
+ * C-left icon, after an area change). */
+static void gfx_logical_unmark(const void* start, uint32_t size) {
+    uintptr_t s = (uintptr_t)start, e = s + size;
+    if (e < s) e = ~(uintptr_t)0;
+    for (int i = 0; i < LOGICAL_MAX; i++) {
+        uintptr_t cs = sLogicalS[i], ce = sLogicalE[i];
+        if (ce == 0 || ce <= s || cs >= e) {
+            continue;
+        }
+        if (cs >= s && ce <= e) { /* all of it reused */
+            sLogicalE[i] = 0;
+        } else if (cs < s && ce > e) { /* reused in the middle: the left part stays here, the right part moves */
+            int k;
+            for (k = 0; k < LOGICAL_MAX; k++) {
+                if (sLogicalE[k] == 0) {
+                    sLogicalS[k] = e;
+                    __sync_synchronize();
+                    sLogicalE[k] = ce;
+                    break;
+                }
+            }
+            sLogicalE[i] = s;
+        } else if (cs < s) { /* the end reused */
+            sLogicalE[i] = s;
+        } else { /* the start reused */
+            sLogicalS[i] = e;
+        }
+    }
+}
+void gfx_texture_cache_invalidate_range(const void* start, uint32_t size);
+void gfx_mark_logical_texture(const void* start, uint32_t size) {
+    int i, slot = -1;
+    uintptr_t s = (uintptr_t)start, e = s + size;
+    if (start == NULL || size == 0) return;
+    gfx_texture_cache_invalidate_range(start, size); /* (also unmarks what this memory was before) */
+    /* PORT (2026-10-26): a range that touches a marked one extends it. CmpDma_LoadAllFiles unpacks a whole archive
+     * file after file into one buffer (the pause screens: over 80 icons): one entry each overflowed the table, the
+     * oldest were dropped and those icons went back to the ^ 7 read (user report: shield and masks missing, the sword's
+     * colours wrong). */
+    for (i = 0; i < LOGICAL_MAX; i++) {
+        uintptr_t ce = sLogicalE[i], cs = sLogicalS[i];
+        if (ce != 0 && s <= ce && e >= cs) {
+            if (s < cs) sLogicalS[i] = s; /* (widening only: a concurrent reader sees the old or the new range) */
+            if (e > ce) sLogicalE[i] = e;
+            return;
+        }
+    }
+    for (i = 0; i < LOGICAL_MAX; i++) {
+        if (sLogicalE[i] == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) { /* full: replace the entry drawn from longest ago */
+        uint32_t now = sLogicalClock, best = 0;
+        slot = 0;
+        for (i = 0; i < LOGICAL_MAX; i++) {
+            uint32_t age = now - sLogicalHit[i];
+            if (age >= best) {
+                best = age;
+                slot = i;
+            }
+        }
+        sLogicalE[slot] = 0;
+        __sync_synchronize();
+    }
+    sLogicalHit[slot] = sLogicalClock;
+    sLogicalS[slot] = s;
+    __sync_synchronize();
+    sLogicalE[slot] = e;
+}
+static int gfx_is_logical(uintptr_t a) {
+    for (int i = 0; i < LOGICAL_MAX; i++) {
+        uintptr_t e = sLogicalE[i];
+        if (e != 0 && a < e && a >= sLogicalS[i]) {
+            sLogicalHit[i] = ++sLogicalClock;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 #include "port_u32_assets.h"
 static uintptr_t gfx_src_swizzle(const void* p) {
     static const PortU32Asset* sSorted[256];
     static int sN = -1;
     uintptr_t a = (uintptr_t)p;
+    /* PORT (2026-10-26): natively compiled assets (inside the loaded binary image) are always in native order: a
+     * logical mark there can only be a stray one (user report: Tingle's eyes, a 4 KB native texture, came out as
+     * scrambled black and white blocks while the rest of his object was right). */
+    extern char __end__[];
+    int inImage = a >= 0x00100000u && a < (uintptr_t)__end__;
+    if (!inImage && gfx_is_logical(a)) {
+        return 0u; /* archive data: already in N64 byte order */
+    }
     int lo, hi;
     if (sN < 0) { /* sort the linked arrays by address once */
         int i, j;
@@ -1017,8 +1244,29 @@ static uint32_t gfx_gather_texture(int tile) {
     uint32_t dst_stride, rows, x, y;
     uintptr_t sw = gfx_src_swizzle(src);
     if (row == 0 || full == 0 || row == full) { /* contiguous (LOADBLOCK) */
+        uint32_t dxt = rdp.loaded_texture[tile].dxt, line = sImpTile->line_size_bytes;
         if (size > sizeof(sTexStage)) return 0;
         for (x = 0; x < size; x++) sTexStage[x] = TEX_SRC_BYTE_X(src + x, sw);
+        /* PORT (2026-10-28): TMEM's odd-line word swap. The RDP reads every odd row of a texture with its 32-bit words
+         * swapped; LOADBLOCK swaps the words of the rows its dxt counter marks odd, so with an exact dxt the two cancel.
+         * A texture loaded with dxt 0 (gDPLoadTextureBlockS: data stored with odd rows pre-swapped) or an inexact one
+         * keeps a swap the port ignored: the env-mapped rupees, bottles and Koume's gem shimmered with stripes as
+         * their texture coordinates moved over the swapped rows (user report, videos). */
+        if (dxt != 0xFFFFFFFFu && line >= 8 && (line & 7) == 0 && sImpTile->siz != G_IM_SIZ_32b) {
+            uint32_t words = size / 8, i;
+            for (i = 0; i < words; i++) {
+                uint32_t rowOdd = (i * 8 / line) & 1,
+                         loadOdd = (((i + rdp.loaded_texture[tile].word_off) * dxt) >> 11) & 1;
+                if (rowOdd != loadOdd) {
+                    uint8_t* q = &sTexStage[i * 8];
+                    uint32_t a, b;
+                    memcpy(&a, q, 4);
+                    memcpy(&b, q + 4, 4);
+                    memcpy(q, &b, 4);
+                    memcpy(q + 4, &a, 4);
+                }
+            }
+        }
         return size;
     }
     rows = size / row;
@@ -1063,15 +1311,191 @@ static void texdump_record(const uint8_t* addr, uint8_t fmt, uint8_t siz, uint32
 }
 #endif
 
+/* PORT (2026-10-26): on-demand texture dump (the touch panel's settings page: "Texture dump"). The next two logic
+ * frames re-import every texture they draw (the cache is emptied) and each one, decoded, goes to
+ * sdmc:/3ds/mm/texdump.bin - the same records as PORT_TEXDUMP: "TEXD", source address, fmt | siz << 8, width,
+ * height, then width * height RGBA8. tools/port/texcheck.py compares them with the PNGs extracted from the ROM. */
+volatile int gPortTexDumpReq;   /* 3ds_main.c: 1 = start a dump at the next frame */
+volatile int gPortTexDumpState; /* 0 idle, 1 dumping, 2 saved, 3 failed (shown on the settings page) */
+static FILE* sTexDumpFile;
+static int sTexDumpFrames;
+static const uint8_t* sTexDumpSeen[1024];
+static uint32_t sTexDumpSeenKey[1024];
+static int sTexDumpN;
+/* PORT (2026-10-31): with the texture dump, the first frame's draws are also written to sdmc:/3ds/mm/drawlog.txt: one
+ * line per render state (textures, render mode, combiner, tiles, room or actor) with its triangle count and where
+ * they landed on the screen (N64 pixels) and how far away (w) - which draw puts what where */
+static FILE* sDrawTxt;
+static int sDrawTxtTris;
+static int sDrawTxtTrisLogged;
+static float sDrawTxtBox[6];
+static void drawlog_end_batch(void) {
+    if (sDrawTxt != NULL && sDrawTxtTris > 0) {
+        fprintf(sDrawTxt, "   tris=%d x=%.0f..%.0f y=%.0f..%.0f w=%.1f..%.1f\n", sDrawTxtTris, sDrawTxtBox[0], sDrawTxtBox[1],
+                sDrawTxtBox[2], sDrawTxtBox[3], sDrawTxtBox[4], sDrawTxtBox[5]);
+    }
+    sDrawTxtTris = 0;
+}
+/* TEMPORARY GPU-side drawlog (gfx_citro3d.c submitDraw_impl): what the GPU is actually given, one "G" line per draw */
+int PortGfx_DlogOn(void) { return sDrawTxt != NULL; }
+uint32_t PortGfx_DlogBatch(void) { return sBatchId; }
+void PortGfx_DlogLine(const char* s) { if (sDrawTxt != NULL) fputs(s, sDrawTxt); }
+/* PORT (2026-11-10, TEMPORARY): L + R + SELECT (3ds_main.c) writes the next DRAWLOG_FRAMES frames' draws to
+ * sdmc:/3ds/mm/drawlog.txt, without the texture dump: what the renderer did with every vertex load, display-list cull and
+ * branch, triangle (route, clipped pieces) and draw (GPU state) while the Milk Road wall is missing */
+volatile int gPortDrawLogReq; /* (release: nothing sets it - the L + R + SELECT trigger and the menu row were removed) */
+#define DRAWLOG_FRAMES 24 /* (the vanishing lasts a blink: a run of frames while the camera turns) */
+static int sDrawLogFrame;
+int PortGfx_DlogMulti(void) { return sDrawLogFrame > 0; } /* (gfx_citro3d.c: lighter G lines) */
+int PortGfx_DlogFrame(void) { return sDrawLogFrame; }    /* (gfx_citro3d.c: the heavy checks in the first frame only) */
+static void drawlog_header(void) {
+    extern int gPortWidescreen, gPortHiDetail, gPortRawVtx, gPortRawRelax, gPortShadeSplit, gPortShadeLinear, gPortReplayRec;
+    fprintf(sDrawTxt, "FRAME %d build=2026-11-12-release rawVtx=%d relax=%d replay=%d hiDetail=%d wide=%d split=%d lin=%d "
+                      "clip=%d dims=%ux%u\n",
+            sDrawLogFrame, gPortRawVtx, gPortRawRelax, gPortReplayRec, gPortHiDetail, gPortWidescreen,
+            gPortShadeSplit, gPortShadeLinear, (int)rsp.clip_ratio, (unsigned)gfx_current_dimensions.width,
+            (unsigned)gfx_current_dimensions.height);
+}
+static void texdump_rt_frame(void) { /* gfx_start_frame (render thread) */
+    { /* (TEMPORARY, 2026-11-11) the previous frame's buffer use, and any triangles dropped because a buffer was full */
+        extern u32 gPortDropTris[3];
+        extern void gfx_citro3d_usage(u32 out[6]);
+        static int sDropReports;
+        u32 use[6];
+        gfx_citro3d_usage(use);
+        if (gPortDropTris[0] | gPortDropTris[1] | gPortDropTris[2]) {
+            if (sDropReports < 12) {
+                extern void PortDbg(const char* s);
+                char b[200];
+                sDropReports++;
+                snprintf(b, sizeof(b), "[gfx] frame %u: triangles dropped (buffer full) vbo=%u raw=%u idx=%u | used vbo %u/%u raw %u/%u tris %u/%u",
+                         (unsigned)gfx_port_frame_index, (unsigned)gPortDropTris[0], (unsigned)gPortDropTris[1],
+                         (unsigned)gPortDropTris[2], (unsigned)use[0], (unsigned)use[1], (unsigned)use[2], (unsigned)use[3],
+                         (unsigned)use[4], (unsigned)use[5]);
+                PortDbg(b);
+            }
+        }
+        if (sDrawTxt != NULL) {
+            fprintf(sDrawTxt, "B frame end: dropped vbo=%u raw=%u idx=%u | used vbo %u/%u raw %u/%u tris %u/%u\n",
+                    (unsigned)gPortDropTris[0], (unsigned)gPortDropTris[1], (unsigned)gPortDropTris[2], (unsigned)use[0],
+                    (unsigned)use[1], (unsigned)use[2], (unsigned)use[3], (unsigned)use[4], (unsigned)use[5]);
+        }
+        gPortDropTris[0] = gPortDropTris[1] = gPortDropTris[2] = 0;
+    }
+    if (sDrawTxt != NULL && sDrawLogFrame > 0 && sDrawLogFrame < DRAWLOG_FRAMES) {
+        drawlog_end_batch(); /* the draw log alone: the next frame into the same file */
+        sDrawLogFrame++;
+        sDrawTxtTris = 0;
+        sDrawTxtTrisLogged = 0;
+        drawlog_header();
+    } else if (sDrawTxt != NULL) {
+        drawlog_end_batch();
+        fclose(sDrawTxt);
+        sDrawTxt = NULL;
+        sDrawLogFrame = 0;
+    }
+    if (gPortDrawLogReq && sDrawTxt == NULL && sTexDumpFile == NULL) {
+        gPortDrawLogReq = 0;
+        sDrawTxt = fopen("sdmc:/3ds/mm/drawlog.txt", "w");
+        if (sDrawTxt != NULL) {
+            setvbuf(sDrawTxt, NULL, _IOFBF, 65536);
+            sDrawTxtTris = 0;
+            sDrawTxtTrisLogged = 0;
+            sDrawLogFrame = 1;
+            drawlog_header();
+        }
+    }
+    if (sTexDumpFile != NULL && --sTexDumpFrames <= 0) {
+        fclose(sTexDumpFile);
+        sTexDumpFile = NULL;
+        gPortTexDumpState = 2;
+    }
+    if (gPortTexDumpReq && sTexDumpFile == NULL) {
+        gPortTexDumpReq = 0;
+        sTexDumpFile = fopen("sdmc:/3ds/mm/texdump.bin", "wb");
+        if (sTexDumpFile == NULL) {
+            gPortTexDumpState = 3;
+            return;
+        }
+        gPortTexDumpState = 1;
+        sTexDumpFrames = 3; /* this frame and the next two */
+        sDrawTxt = fopen("sdmc:/3ds/mm/drawlog.txt", "w");
+        if (sDrawTxt != NULL) setvbuf(sDrawTxt, NULL, _IOFBF, 65536);
+        sDrawTxtTris = 0;
+        sDrawTxtTrisLogged = 0;
+        sTexDumpN = 0;
+        gfx_texture_cache_invalidate_now((const void*)0, 0xFFFFFFFFu); /* everything drawn is imported again (not
+                                                                         * the _range one: that would unmark the archives) */
+    }
+}
+static void texdump_rt_record(const uint8_t* addr, uint8_t fmt, uint8_t siz, uint32_t size_bytes, uint32_t line_bytes) {
+    uint32_t bits, w, h, hdr[4], key = (uint32_t)fmt | ((uint32_t)siz << 8) | (size_bytes << 16);
+    int i;
+    if (sTexDumpFile == NULL || line_bytes == 0) return;
+    for (i = 0; i < sTexDumpN; i++) {
+        if (sTexDumpSeen[i] == addr && sTexDumpSeenKey[i] == key) return;
+    }
+    if (sTexDumpN >= 1024) return;
+    sTexDumpSeen[sTexDumpN] = addr;
+    sTexDumpSeenKey[sTexDumpN++] = key;
+    bits = (siz == G_IM_SIZ_4b) ? 4 : (siz == G_IM_SIZ_8b) ? 8 : (siz == G_IM_SIZ_16b) ? 16 : 32;
+    w = (siz == G_IM_SIZ_32b) ? line_bytes / 2 : line_bytes * 8 / bits; /* 32b: TMEM line counts 2 bytes/texel */
+    h = (siz == G_IM_SIZ_32b) ? (size_bytes / 2) / line_bytes : size_bytes / line_bytes;
+    if (w == 0 || h == 0 || w * h * 4 > sizeof(rgba32_buf)) return;
+    hdr[0] = 0x44584554u; /* "TEXD" */
+    hdr[1] = (uint32_t)(uintptr_t)addr;
+    hdr[2] = (uint32_t)fmt | ((uint32_t)siz << 8);
+    hdr[3] = w;
+    fwrite(hdr, 4, 4, sTexDumpFile);
+    fwrite(&h, 4, 1, sTexDumpFile);
+    fwrite(rgba32_buf, 1, w * h * 4, sTexDumpFile);
+}
+
 static void import_texture_impl(int unit, int tile_index) {
     sImpTile = &rdp.tiles[tile_index];
     int tile = sImpTile->tmem != 0; /* TMEM slot: the importers below index loaded_texture[] with it */
     uint8_t fmt = sImpTile->fmt;
     uint8_t siz = sImpTile->siz;
+#ifdef __3DS__
+    /* PORT (2026-10-28): mip levels. A mipmapped texture (G_TL_LOD: water, ground) is loaded with ONE LOADBLOCK at TMEM 0
+     * and its smaller levels are tiles pointing further into it. Such a tile (TMEM != 0) read the "other" slot, whatever
+     * was loaded there last - an unrelated texture, tiny and repeated, drawn whenever the distance-based LOD fraction
+     * picked the second level (user report: a flickering crosshatch on the ground outside the Deku Palace at some
+     * places and angles). When the last load reaching that TMEM address was the block at 0, the level is read from it. */
+    if (tile == 1 && rdp.loaded_texture[0].dxt != 0xFFFFFFFFu && rdp.loaded_texture[0].word_off == 0 &&
+        (rdp.loaded_texture[0].seq > rdp.loaded_texture[1].seq ||
+         (rdp.loaded_texture[0].seq == rdp.loaded_texture[1].seq && rdp.loaded_texture[1].word_off != sImpTile->tmem)) &&
+        (uint32_t)sImpTile->tmem * 8u < rdp.loaded_texture[0].size_bytes) {
+        uint32_t off = (uint32_t)sImpTile->tmem * 8u;
+        rdp.loaded_texture[1].addr = rdp.loaded_texture[0].addr + off;
+        rdp.loaded_texture[1].size_bytes = rdp.loaded_texture[0].size_bytes - off;
+        rdp.loaded_texture[1].line_size_bytes = rdp.loaded_texture[1].size_bytes;
+        rdp.loaded_texture[1].full_image_line_size_bytes = rdp.loaded_texture[1].size_bytes;
+        rdp.loaded_texture[1].dxt = rdp.loaded_texture[0].dxt;
+        rdp.loaded_texture[1].word_off = sImpTile->tmem;
+        rdp.loaded_texture[1].seq = rdp.loaded_texture[0].seq;
+    }
+    /* PORT (2026-10-30): a tile with a row mask (maskt) shows only its first 1 << maskt rows: the RDP wraps (or mirrors)
+     * every t coordinate into them. A mipmapped texture's ONE LOADBLOCK holds the whole chain, so the base level's tile
+     * (and a level read from it above) "had" all the smaller levels as extra rows below it: imported that tall, the
+     * texture coordinates were scaled to the wrong height and the ground showed the base image squashed with strips of
+     * the other levels - the torn, scribbled dirt paths in the Deku Palace's left garden (user reports, videos). Rows
+     * past the mask are dropped here; import_texture puts the slot's size back. */
+    if (sImpTile->maskt != 0 && sImpTile->maskt < 12 && sImpTile->line_size_bytes != 0) {
+        uint32_t rowBytes = sImpTile->line_size_bytes * (siz == G_IM_SIZ_32b ? 2u : 1u);
+        uint32_t cap = rowBytes << sImpTile->maskt;
+        if (cap < rdp.loaded_texture[tile].size_bytes) {
+            sCropSlot = tile;
+            sCropOrig = rdp.loaded_texture[tile].size_bytes;
+            rdp.loaded_texture[tile].size_bytes = cap;
+        }
+    }
+#endif
 
 #ifdef PORT_ICONGEN
     if (!sMeshRedecode)
 #endif
+    imp_rep_compute(sImpTile->line_size_bytes, rdp.loaded_texture[tile].size_bytes, siz);
     if (gfx_texture_cache_lookup(unit, &rendering_state.textures[unit], rdp.loaded_texture[tile].addr, fmt, siz, rdp.loaded_texture[tile].size_bytes)) {
         return;
     }
@@ -1145,6 +1569,8 @@ static void import_texture_impl(int unit, int tile_index) {
     texdump_record(rdp.loaded_texture[tile].addr, fmt, siz, rdp.loaded_texture[tile].size_bytes,
                    sImpTile->line_size_bytes);
 #endif
+    texdump_rt_record(rdp.loaded_texture[tile].addr, fmt, siz, rdp.loaded_texture[tile].size_bytes,
+                      sImpTile->line_size_bytes);
 }
 
 static void gfx_normalize_vector(float v[3]) {
@@ -1218,10 +1644,43 @@ static int sInterpRecord = 0;
 /* group stack (G_NOOP tags) */
 #define INTERP_DEPTH 16
 static uint32_t sGrpId[INTERP_DEPTH], sGrpMtx[INTERP_DEPTH], sGrpVtx[INTERP_DEPTH];
+/* PORT (2026-10-26): matrices are paired with last frame's by WHICH matrix they are, not only by their order. A flex
+ * skeleton's limb matrices (Link: SkelAnime_DrawFlexLod) are loaded from segment 0x0D by address: keyed by that
+ * address; the other matrices (equipment drawn after a limb) by their order since the last such load. Counting alone
+ * shifted every pairing after a matrix that came or went (Z-targeting raises the shield, swaps hand models): limbs
+ * blended toward other limbs and Link tore apart for a frame at 60 fps (user report, video). */
+static uint32_t sGrpLastSeg[INTERP_DEPTH], sGrpSub[INTERP_DEPTH];
+static uint32_t sInterpMtxW1; /* the G_MTX command's address word, for the key */
+static uintptr_t sInterpMtxAddr; /* ...and where it points */
+/* the flex skeleton matrix array (segment 0x0D) set inside each group: a limb's matrix is loaded both by pointer (in its
+ * own limb draw) and by segment address (from its neighbours' meshes) - both are keyed by their slot in the array */
+static uintptr_t sGrpSkel[INTERP_DEPTH];
+/* PORT (2026-10-26): each limb is blended relative to its PARENT limb (z_skelanime.c tags the hierarchy: OP_PARENT) and
+ * re-attached to the parent's blended transform, as 2Ship2Harkinian blends the skeleton's joint rotations. Blending the
+ * world matrices on their own moved a limb along the straight line between its two places while its parent turned:
+ * on a sudden stop or when the ocarina came out (the whole pose changes in one update) Link's limbs were pulled
+ * forward off his body and snapped back (user report). */
+#define INTERP_LIMBS 64
+static uint8_t sGrpParent[INTERP_DEPTH][INTERP_LIMBS];  /* parent slot + 1, 0 = unknown / none */
+static uint8_t sGrpLimbState[INTERP_DEPTH][INTERP_LIMBS]; /* 0 not yet, 1 blended, 2 drawn as it is */
+static float sGrpLimbOut[INTERP_DEPTH][INTERP_LIMBS][2][4][4];
 static uint8_t sGrpFlags[INTERP_DEPTH];
 static int sGrpDepth;
+/* PORT (2026-10-26): per-group reference transform (the group's first rigid matrix, the actor's root). Every
+ * other matrix of the group is blended RELATIVE to it and re-attached to the blended root, so limbs swing
+ * along the root's arc instead of cutting chords through the body, and the snap decision is made once for
+ * the whole actor (user report, 60 fps: Link tore apart / doubled for a frame on a fast Z-target turn - some
+ * limbs passed the 90-degree snap rule and jumped, others blended). 0 = none yet, 1 = set, 2 = snapped. */
+static uint8_t sGrpRefState[INTERP_DEPTH];
+static float sGrpRefInv[INTERP_DEPTH][2][4][4]; /* [0] = inverse of previous root, [1] = inverse of current */
+static float sGrpRefOut[INTERP_DEPTH][2][4][4]; /* blended root for t = 1/3, 2/3 */
 /* occurrences of the same group path within one pass (a model drawn twice under one tag) */
 static uint32_t sOccKey[2048], sOccCnt[2048], sOccStamp[2048], sInterpStamp;
+/* PORT (2026-11-15): the camera's view matrix (world -> camera) in this pass: previous logic frame's, this one's, and the
+ * inverses of its in-between blends (PORT_INTERP_CAMREL groups are blended in camera space and put back with these) */
+static uint8_t sGrpIsCam[INTERP_DEPTH];
+static float sCamV[2][4][4], sCamVOutInv[2][4][4];
+static uint32_t sCamVStamp;
 uint32_t gPortInterpMatched, gPortInterpMissed, gPortInterpSame, gPortInterpJump, gPortInterpVtx, gPortInterpVtxMiss;
 
 static uint32_t interp_mix(uint32_t a, uint32_t b) {
@@ -1232,8 +1691,17 @@ static uint32_t interp_mix(uint32_t a, uint32_t b) {
     return h;
 }
 
+static void interp_limb_record(int d, uint32_t slot);
+/* PORT (2026-10-28): the camera cut this frame (its group is pushed with SKIP: z_view.c, the eye jumped or changed speed
+ * sharply - Z-targeting, the ocarina's close-up). The camera is drawn where it now is, so nothing else may blend
+ * either: Link kept blending from where he was on screen under the new camera and lagged behind, doubled, for a frame
+ * (user report, video). The whole frame is drawn as it is. */
+static int sInterpFrameCut;
 static void interp_group(uint32_t w0, uint32_t w1) {
     int op = (w0 >> 8) & 0xFF;
+    if (op == PORT_INTERP_OP_PUSH && w1 == PORT_INTERP_ID_CAMERA && (w0 & PORT_INTERP_SKIP)) {
+        sInterpFrameCut = 1;
+    }
     if (op == PORT_INTERP_OP_PUSH) {
         if (sGrpDepth < INTERP_DEPTH) {
             uint32_t parent = sGrpDepth > 0 ? sGrpId[sGrpDepth - 1] : 0x51ED5EEDu;
@@ -1255,14 +1723,31 @@ static void interp_group(uint32_t w0, uint32_t w1) {
             }
             id = interp_mix(id, probes < 2048 ? sOccCnt[h]++ : 0);
             sGrpId[sGrpDepth] = id;
-            sGrpFlags[sGrpDepth] = (uint8_t)(w0 & 0xFF) | (sGrpDepth > 0 ? (sGrpFlags[sGrpDepth - 1] & PORT_INTERP_SKIP) : 0);
+            sGrpFlags[sGrpDepth] = (uint8_t)(w0 & 0xFF) |
+                                   (sGrpDepth > 0 ? (sGrpFlags[sGrpDepth - 1] & (PORT_INTERP_SKIP | PORT_INTERP_CAMREL)) : 0);
+            sGrpIsCam[sGrpDepth] = w1 == PORT_INTERP_ID_CAMERA;
             sGrpMtx[sGrpDepth] = 0;
+            sGrpLastSeg[sGrpDepth] = 0;
+            sGrpSub[sGrpDepth] = 0;
+            sGrpSkel[sGrpDepth] = 0;
+            memset(sGrpParent[sGrpDepth], 0, sizeof(sGrpParent[0]));
+            memset(sGrpLimbState[sGrpDepth], 0, sizeof(sGrpLimbState[0]));
             sGrpVtx[sGrpDepth] = 0;
+            /* a snapped parent (actor turned too far this frame) snaps its children too */
+            sGrpRefState[sGrpDepth] = (sGrpDepth > 0 && sGrpRefState[sGrpDepth - 1] == 2) ? 2 : 0;
         }
         sGrpDepth++;
     } else if (op == PORT_INTERP_OP_POP) {
         if (sGrpDepth > 0) {
             sGrpDepth--;
+        }
+    } else if (op == PORT_INTERP_OP_PARENT) {
+        if (sGrpDepth > 0 && sGrpDepth <= INTERP_DEPTH) {
+            uint32_t slot = (w1 >> 8) & 0xFF, parent = w1 & 0xFF;
+            if (slot < INTERP_LIMBS) {
+                sGrpParent[sGrpDepth - 1][slot] = parent < INTERP_LIMBS ? (uint8_t)(parent + 1) : 0;
+                interp_limb_record(sGrpDepth - 1, slot); /* (every slot, also the ones only their children load) */
+            }
         }
     }
 }
@@ -1271,7 +1756,7 @@ static int interp_find(uint32_t key) {
     uint32_t h = (key * 2654435761u) & (INTERP_HASH - 1);
     while (sInterpHash[h] != 0) {
         int i = sInterpHash[h] - 1;
-        if (i < 0x4000 ? sInterpTab[sInterpCurTab ^ 1][i].key == key : 0) {
+        if ((unsigned)i < (unsigned)sInterpN[sInterpCurTab ^ 1] ? sInterpTab[sInterpCurTab ^ 1][i].key == key : 0) {
             return i;
         }
         h = (h + 1) & (INTERP_HASH - 1);
@@ -1340,16 +1825,184 @@ static int interp_decomposed(float out[4][4], const float a[4][4], const float b
     return 1;
 }
 
+/* row-vector affine helpers (rows 0-2 linear part, row 3 translation, column 3 = 0 0 0 1) */
+static int interp_affine_inv(float o[4][4], const float a[4][4]) {
+    float d = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+              a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    int i, k;
+    if (fabsf(d) < 1e-12f) {
+        return 0;
+    }
+    d = 1.0f / d;
+    o[0][0] = (a[1][1] * a[2][2] - a[1][2] * a[2][1]) * d;
+    o[0][1] = (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * d;
+    o[0][2] = (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * d;
+    o[1][0] = (a[1][2] * a[2][0] - a[1][0] * a[2][2]) * d;
+    o[1][1] = (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * d;
+    o[1][2] = (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * d;
+    o[2][0] = (a[1][0] * a[2][1] - a[1][1] * a[2][0]) * d;
+    o[2][1] = (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * d;
+    o[2][2] = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * d;
+    for (k = 0; k < 3; k++) {
+        o[3][k] = -(a[3][0] * o[0][k] + a[3][1] * o[1][k] + a[3][2] * o[2][k]);
+    }
+    for (i = 0; i < 3; i++) {
+        o[i][3] = 0.0f;
+    }
+    o[3][3] = 1.0f;
+    return 1;
+}
+
+static void interp_affine_mul(float o[4][4], const float a[4][4], const float b[4][4]) {
+    int i, k;
+    for (i = 0; i < 4; i++) {
+        for (k = 0; k < 3; k++) {
+            o[i][k] = a[i][0] * b[0][k] + a[i][1] * b[1][k] + a[i][2] * b[2][k] + (i == 3 ? b[3][k] : 0.0f);
+        }
+        o[i][3] = i == 3 ? 1.0f : 0.0f;
+    }
+}
+
+/* a transform blended in the world (a group's root, a skeleton's root limb) for in-between frame k (t = (k + 1) / 3) of
+ * group g. PORT (2026-11-15): a PORT_INTERP_CAMREL group is blended as seen from the camera (its transform times the
+ * camera's view, previous and current) and put back in the world with the blended camera's view: something held in front
+ * of the camera stays where it is on screen while both move, as on the logic frames (first-person bow / hookshot). */
+static int interp_world(float out[4][4], const float a[4][4], const float b[4][4], int k, int g) {
+    float t = (k + 1) * (1.0f / 3.0f);
+    if (g >= 0 && g < INTERP_DEPTH && (sGrpFlags[g] & PORT_INTERP_CAMREL) && sCamVStamp == sInterpStamp) {
+        float ra[4][4], rb[4][4], rt[4][4];
+        interp_affine_mul(ra, a, sCamV[0]);
+        interp_affine_mul(rb, b, sCamV[1]);
+        if (!interp_decomposed(rt, ra, rb, t)) {
+            return 0;
+        }
+        interp_affine_mul(out, rt, sCamVOutInv[k]);
+        return 1;
+    }
+    return interp_decomposed(out, a, b, t);
+}
+
+/* a matrix in guMtxF2L's word-packed layout (as gfx_sp_matrix reads it) */
+static void interp_read_mtx(float m[4][4], const void* addr) {
+    const int16_t* ip = (const int16_t*)addr;
+    const uint16_t* fp = (const uint16_t*)addr + 16;
+    int i, j;
+    for (i = 0; i < 4; i++) {
+        for (j = 0; j < 4; j++) {
+            int sk = (i * 4 + j) ^ 1;
+            m[i][j] = (float)(((int32_t)ip[sk] << 16) | fp[sk]) / 65536.0f;
+        }
+    }
+}
+
+static uint32_t interp_limb_key(int d, uint32_t slot) {
+    return interp_mix(sGrpId[d] ^ 0x5E6A0000u, (0x0D000000u | (slot << 6)) * 4) | 1;
+}
+
+static void interp_limb_record(int d, uint32_t slot) {
+    int n;
+    if (!sInterpRecord || sGrpSkel[d] == 0) {
+        return;
+    }
+    n = sInterpN[sInterpCurTab];
+    if (n < INTERP_MAX) {
+        sInterpTab[sInterpCurTab][n].key = interp_limb_key(d, slot);
+        interp_read_mtx(sInterpTab[sInterpCurTab][n].m, (const void*)(sGrpSkel[d] + slot * 64));
+        sInterpN[sInterpCurTab] = n + 1;
+    }
+}
+
+static int interp_rigid(const float m[4][4]) {
+    return m[0][3] == 0.0f && m[1][3] == 0.0f && m[2][3] == 0.0f && m[3][3] == 1.0f;
+}
+
+/* limb `slot` of group d at t = 1/3, 2/3: 1 = out written, 0 = draw it as it is */
+static int interp_limb(int d, uint32_t slot, float out[2][4][4], int depth) {
+    float cur[4][4];
+    const float(*prev)[4];
+    int idx, k, par;
+    if (sGrpLimbState[d][slot] == 1) {
+        memcpy(out, sGrpLimbOut[d][slot], sizeof(float) * 32);
+        return 1;
+    }
+    if (sGrpLimbState[d][slot] == 2 || depth > INTERP_LIMBS) {
+        return 0;
+    }
+    sGrpLimbState[d][slot] = 2; /* (until it is known to blend) */
+    interp_read_mtx(cur, (const void*)(sGrpSkel[d] + slot * 64));
+    idx = interp_find(interp_limb_key(d, slot));
+    if (idx < 0) {
+        return 0;
+    }
+    prev = sInterpTab[sInterpCurTab ^ 1][idx].m;
+    if (!interp_rigid(cur) || !interp_rigid(prev)) {
+        return 0;
+    }
+    par = sGrpParent[d][slot] - 1;
+    if (par >= 0 && par != (int)slot) {
+        float pcur[4][4], pinv_c[4][4], pinv_p[4][4], pout[2][4][4], lp[4][4], lm[4][4], lt[4][4];
+        int pidx = interp_find(interp_limb_key(d, (uint32_t)par));
+        interp_read_mtx(pcur, (const void*)(sGrpSkel[d] + par * 64));
+        if (pidx >= 0 && interp_rigid(pcur) && interp_affine_inv(pinv_c, pcur) &&
+            interp_affine_inv(pinv_p, sInterpTab[sInterpCurTab ^ 1][pidx].m)) {
+            if (!interp_limb(d, (uint32_t)par, pout, depth + 1)) {
+                memcpy(pout[0], pcur, sizeof(pcur)); /* the parent is drawn as it is: follow it */
+                memcpy(pout[1], pcur, sizeof(pcur));
+            }
+            interp_affine_mul(lp, prev, pinv_p);
+            interp_affine_mul(lm, cur, pinv_c);
+            for (k = 0; k < 2; k++) {
+                if (!interp_decomposed(lt, lp, lm, (k + 1) * (1.0f / 3.0f))) {
+                    memcpy(lt, lm, sizeof(lt)); /* this joint snapped: keep it on its parent */
+                }
+                interp_affine_mul(out[k], lt, pout[k]);
+            }
+            memcpy(sGrpLimbOut[d][slot], out, sizeof(float) * 32);
+            sGrpLimbState[d][slot] = 1;
+            return 1;
+        }
+    }
+    /* the root (or a parent not seen last frame): blended in the world */
+    for (k = 0; k < 2; k++) {
+        if (!interp_world(out[k], prev, cur, k, d)) {
+            return 0;
+        }
+    }
+    memcpy(sGrpLimbOut[d][slot], out, sizeof(float) * 32);
+    sGrpLimbState[d][slot] = 1;
+    return 1;
+}
+
 /* blend `m` (this logic frame's matrix) from the previous frame's into out[k] for t = (k + 1) / 3 (copies
  * of m when there is nothing to blend); records m on the exact pass. Returns 1 when out[] was written. */
 static int interp_matrix3(const float m[4][4], uint8_t parameters, float out[2][4][4]) {
     uint32_t key;
-    int idx, k;
+    int idx, k, g, rigid;
     const float(*p)[4];
     if (sGrpDepth <= 0 || sGrpDepth > INTERP_DEPTH) {
         return 0; /* untagged: drawn as it is */
     }
-    key = interp_mix(sGrpId[sGrpDepth - 1], sGrpMtx[sGrpDepth - 1]++ * 4 + (parameters & G_MTX_PROJECTION ? 1 : 0)) | 1;
+    {
+        int d = sGrpDepth - 1;
+        uint32_t seg = sInterpMtxW1 >> 24;
+        uint32_t proj = parameters & G_MTX_PROJECTION ? 1 : 0;
+        sGrpMtx[d]++;
+        if (sGrpSkel[d] != 0 && sInterpMtxAddr - sGrpSkel[d] < 64u * 64u && ((sInterpMtxAddr - sGrpSkel[d]) & 63u) == 0) {
+            /* a limb of this group's flex skeleton: its slot */
+            uint32_t slot = (uint32_t)((sInterpMtxAddr - sGrpSkel[d]) >> 6);
+            sGrpLastSeg[d] = 0x0D000000u | (slot << 6);
+            sGrpSub[d] = 0;
+            key = interp_mix(sGrpId[d] ^ 0x5E6A0000u, sGrpLastSeg[d] * 4 + proj) | 1;
+        } else if (seg >= 0x08 && seg <= 0x0F) { /* a segmented matrix array (flex skeleton limbs): its address */
+            sGrpLastSeg[d] = sInterpMtxW1;
+            sGrpSub[d] = 0;
+            key = interp_mix(sGrpId[d] ^ 0x5E6A0000u, sInterpMtxW1 * 4 + proj) | 1;
+        } else if (sGrpLastSeg[d] != 0) { /* drawn after a limb: its order since that limb's matrix */
+            key = interp_mix(interp_mix(sGrpId[d], sGrpLastSeg[d]), sGrpSub[d]++ * 4 + proj) | 1;
+        } else {
+            key = interp_mix(sGrpId[d], (sGrpMtx[d] - 1) * 4 + proj) | 1;
+        }
+    }
     if (sInterpRecord) {
         int n = sInterpN[sInterpCurTab];
         if (n < INTERP_MAX) {
@@ -1358,8 +2011,66 @@ static int interp_matrix3(const float m[4][4], uint8_t parameters, float out[2][
             sInterpN[sInterpCurTab] = n + 1;
         }
     }
-    if (!gPortReplayRec || (sGrpFlags[sGrpDepth - 1] & PORT_INTERP_SKIP)) {
+    if (!gPortReplayRec || (sGrpFlags[sGrpDepth - 1] & PORT_INTERP_SKIP) || sInterpFrameCut) {
         return 0;
+    }
+    g = sGrpDepth - 1;
+    if ((sGrpFlags[g] & PORT_INTERP_CAMREL) && !(parameters & G_MTX_PROJECTION)) {
+        /* PORT (2026-11-15): first person: every transform blended on its own in camera space. Through the limb chain
+         * (each joint relative to its parent) the arm and bow came out slightly off the straight camera-space blend the
+         * bow string gets (drawn on the translucent list, with no limb to follow): the string slid against the bow while
+         * aiming up/down/left/right at 60 fps (user report). What stays put on screen now stays put, all of it. */
+        idx = interp_find(key);
+        if (idx < 0) {
+            gPortInterpMissed++;
+            return 0;
+        }
+        p = sInterpTab[sInterpCurTab ^ 1][idx].m;
+        if (interp_rigid(p) && interp_rigid(m)) {
+            for (k = 0; k < 2; k++) {
+                if (!interp_world(out[k], p, m, k, g)) {
+                    gPortInterpJump++;
+                    return 0;
+                }
+            }
+            gPortInterpMatched++;
+            return 1;
+        }
+    }
+    if (sGrpSkel[g] != 0 && sInterpMtxAddr - sGrpSkel[g] < 64u * INTERP_LIMBS &&
+        ((sInterpMtxAddr - sGrpSkel[g]) & 63u) == 0 && !(parameters & G_MTX_PROJECTION)) {
+        uint32_t slot = (uint32_t)((sInterpMtxAddr - sGrpSkel[g]) >> 6);
+        if (sGrpParent[g][slot] != 0 || slot == 0) { /* a tagged skeleton limb: through its parents */
+            int r = interp_limb(g, slot, out, 0);
+            if (r) gPortInterpMatched++;
+            return r;
+        }
+    }
+    if (sGrpSkel[g] != 0 && (sGrpLastSeg[g] >> 24) == 0x0D && !(parameters & G_MTX_PROJECTION)) {
+        /* drawn after a limb (the sword in Link's hand, the shield): relative to that limb, like the limbs */
+        uint32_t slot = (sGrpLastSeg[g] >> 6) & 0x3FFFF;
+        float lout[2][4][4];
+        if (slot < INTERP_LIMBS && sGrpParent[g][slot] != 0 && interp_limb(g, slot, lout, 0)) {
+            float lcur[4][4], inv_c[4][4], inv_p[4][4], lp[4][4], lm[4][4], lt[4][4];
+            int lidx = interp_find(interp_limb_key(g, slot)), pidx = interp_find(key);
+            interp_read_mtx(lcur, (const void*)(sGrpSkel[g] + slot * 64));
+            if (lidx >= 0 && pidx >= 0 && interp_rigid(m) && interp_rigid(sInterpTab[sInterpCurTab ^ 1][pidx].m) &&
+                interp_affine_inv(inv_c, lcur) && interp_affine_inv(inv_p, sInterpTab[sInterpCurTab ^ 1][lidx].m)) {
+                interp_affine_mul(lp, sInterpTab[sInterpCurTab ^ 1][pidx].m, inv_p);
+                interp_affine_mul(lm, m, inv_c);
+                for (k = 0; k < 2; k++) {
+                    if (!interp_decomposed(lt, lp, lm, (k + 1) * (1.0f / 3.0f))) {
+                        memcpy(lt, lm, sizeof(lt));
+                    }
+                    interp_affine_mul(out[k], lt, lout[k]);
+                }
+                gPortInterpMatched++;
+                return 1;
+            }
+        }
+    }
+    if (sGrpRefState[g] == 2) {
+        return 0; /* the whole group snapped this frame */
     }
     idx = interp_find(key);
     if (idx < 0) {
@@ -1368,18 +2079,76 @@ static int interp_matrix3(const float m[4][4], uint8_t parameters, float out[2][
     }
     gPortInterpMatched++;
     p = sInterpTab[sInterpCurTab ^ 1][idx].m;
+    rigid = p[0][3] == 0.0f && p[1][3] == 0.0f && p[2][3] == 0.0f && p[3][3] == 1.0f && m[0][3] == 0.0f &&
+            m[1][3] == 0.0f && m[2][3] == 0.0f && m[3][3] == 1.0f;
+    if (rigid && !(parameters & G_MTX_PROJECTION)) {
+        if (sGrpRefState[g] == 0) {
+            /* the group's root: blend it on its own; its result decides for the whole group */
+            if (interp_affine_inv(sGrpRefInv[g][0], p) && interp_affine_inv(sGrpRefInv[g][1], m)) {
+                for (k = 0; k < 2; k++) {
+                    if (!interp_world(sGrpRefOut[g][k], p, m, k, g)) {
+                        sGrpRefState[g] = 2;
+                        gPortInterpJump++;
+                        return 0;
+                    }
+                }
+                sGrpRefState[g] = 1;
+                if (memcmp(p, m, sizeof(float) * 16) == 0) {
+                    gPortInterpSame++;
+                    return 0;
+                }
+                memcpy(out, sGrpRefOut[g], sizeof(float) * 32);
+                return 1;
+            }
+        } else {
+            /* relative to the root: local = M * root^-1, blended, then re-attached to the blended root */
+            float lp[4][4], lm[4][4], lt[4][4];
+            interp_affine_mul(lp, p, sGrpRefInv[g][0]);
+            interp_affine_mul(lm, m, sGrpRefInv[g][1]);
+            for (k = 0; k < 2; k++) {
+                if (!interp_decomposed(lt, lp, lm, (k + 1) * (1.0f / 3.0f))) {
+                    memcpy(lt, lm, sizeof(lt)); /* this limb itself snapped: keep it attached to the root */
+                }
+                interp_affine_mul(out[k], lt, sGrpRefOut[g][k]);
+            }
+            return 1;
+        }
+    }
+    if (rigid && (parameters & G_MTX_PROJECTION) && sGrpIsCam[g]) { /* the camera's view: kept for CAMREL groups */
+        memcpy(sCamV[0], p, sizeof(float) * 16);
+        memcpy(sCamV[1], m, sizeof(float) * 16);
+        if (memcmp(p, m, sizeof(float) * 16) == 0 && interp_affine_inv(sCamVOutInv[0], m)) {
+            memcpy(sCamVOutInv[1], sCamVOutInv[0], sizeof(float) * 16);
+            sCamVStamp = sInterpStamp;
+        }
+    }
     if (memcmp(p, m, sizeof(float) * 16) == 0) {
         gPortInterpSame++;
         return 0;
     }
     for (k = 0; k < 2; k++) {
         float t = (k + 1) * (1.0f / 3.0f);
-        if (p[0][3] == 0.0f && p[1][3] == 0.0f && p[2][3] == 0.0f && p[3][3] == 1.0f && m[0][3] == 0.0f &&
-            m[1][3] == 0.0f && m[2][3] == 0.0f && m[3][3] == 1.0f) {
+        if (rigid && (parameters & G_MTX_PROJECTION)) {
+            /* PORT (2026-10-28): the camera's view matrix (world -> camera, multiplied into the projection). Its
+             * translation is -R x eye: blending it linearly while the rotation turns moved the implied eye off its
+             * path, and in a fast camera swing (Z-targeting, turning to face Link) the in-between frames saw the
+             * world from the wrong place - Link lagged behind and snapped back (user report, video). The camera's
+             * own transform (the inverse: its position and orientation) is blended and turned back. */
+            float pi_[4][4], mi_[4][4], ti[4][4];
+            if (!interp_affine_inv(pi_, p) || !interp_affine_inv(mi_, m) || !interp_decomposed(ti, pi_, mi_, t) ||
+                !interp_affine_inv(out[k], ti)) {
+                gPortInterpJump++;
+                sInterpFrameCut = 1; /* the camera turned too far to blend: nothing else blends either */
+                return 0;
+            }
+            if (sGrpIsCam[g]) {
+                memcpy(sCamVOutInv[k], ti, sizeof(ti)); /* (the blended camera's own transform = the view's inverse) */
+            }
+        } else if (rigid) {
             /* rigid (modelview, camera view): decomposed. Teleports are the game side's call (the group's
              * SKIP flag: actor moved too far, camera cut), as in Zelda64Recomp - a translation threshold here
              * cannot work, limb matrices are in unscaled model units (x100). */
-            if (!interp_decomposed(out[k], p, m, t)) {
+            if (!interp_world(out[k], p, m, k, g)) {
                 gPortInterpJump++;
                 return 0;
             }
@@ -1391,6 +2160,9 @@ static int interp_matrix3(const float m[4][4], uint8_t parameters, float out[2][
                 }
             }
         }
+    }
+    if (rigid && (parameters & G_MTX_PROJECTION) && sGrpIsCam[g]) {
+        sCamVStamp = sInterpStamp;
     }
     return 1;
 }
@@ -1420,7 +2192,7 @@ static const int16_t (*interp_vtx_prev(const Vtx* v, size_t n))[3] {
             sInterpVN[sInterpCurTab] = f + (int)n;
         }
     }
-    if (!gPortReplayRec || (sGrpFlags[g] & PORT_INTERP_SKIP)) {
+    if (!gPortReplayRec || (sGrpFlags[g] & PORT_INTERP_SKIP) || sInterpFrameCut) {
         return NULL;
     }
     {
@@ -1442,6 +2214,34 @@ static const int16_t (*interp_vtx_prev(const Vtx* v, size_t n))[3] {
  * become "previous" and are indexed; the exact pass of this frame records into the other ones */
 void gfx_interp_begin_frame(void) {
     int i;
+    /* PORT (2026-10-26): crash guard. On hardware, entering the Astral Observatory crashed here (user report, twice;
+     * addr2line: gfx_interp_begin_frame): the loop below ran off the end of the table, so a count it reads had been
+     * overwritten - in the MM port nothing records into these tables, so something else wrote over them. The counts are
+     * checked before use; the first time one is bad, the memory around them is logged to boot.log (the bytes
+     * that overwrote them point at the culprit) and the tables start empty. */
+    if ((unsigned)sInterpCurTab > 1u || (unsigned)sInterpN[0] > INTERP_MAX || (unsigned)sInterpN[1] > INTERP_MAX ||
+        (unsigned)sInterpVN[0] > INTERP_VTX_MAX || (unsigned)sInterpVN[1] > INTERP_VTX_MAX ||
+        (unsigned)sInterpVLN[0] > INTERP_VLOADS || (unsigned)sInterpVLN[1] > INTERP_VLOADS) {
+        static int sLogged;
+        extern void PortDbgX(const char* label, unsigned val);
+        if (!sLogged) {
+            const uint32_t* w = (const uint32_t*)(const void*)sInterpN - 8;
+            sLogged = 1;
+            PortDbgX("[interp] CORRUPTED counters, sInterpN at", (unsigned)(uintptr_t)sInterpN);
+            PortDbgX("[interp]   sInterpN[0]", (unsigned)sInterpN[0]);
+            PortDbgX("[interp]   sInterpN[1]", (unsigned)sInterpN[1]);
+            PortDbgX("[interp]   sInterpCurTab", (unsigned)sInterpCurTab);
+            PortDbgX("[interp]   sInterpVN[0]", (unsigned)sInterpVN[0]);
+            PortDbgX("[interp]   sInterpVLN[0]", (unsigned)sInterpVLN[0]);
+            for (i = 0; i < 20; i++) {
+                PortDbgX("[interp]   word around sInterpN", w[i]);
+            }
+        }
+        sInterpCurTab = 0;
+        sInterpN[0] = sInterpN[1] = 0;
+        sInterpVN[0] = sInterpVN[1] = 0;
+        sInterpVLN[0] = sInterpVLN[1] = 0;
+    }
     sInterpCurTab ^= 1;
     sInterpN[sInterpCurTab] = 0;
     sInterpVN[sInterpCurTab] = 0;
@@ -1459,6 +2259,7 @@ void gfx_interp_pass(float t, int record) {
     (void)t;
     sInterpStamp++;
     sGrpDepth = 0;
+    sInterpFrameCut = 0;
     sInterpRecord = record;
 }
 
@@ -1570,6 +2371,42 @@ static void rec_load_vertex(int dest, const Vtx_t* v, const int16_t* prev) {
     sLoadSrc[dest] = (uint16_t)sRecSrcN++;
 }
 
+/* PORT (2026-11-06): weights of a point p of a triangle (A, B, C given as clip x, y, w): p = wa A + wb B + wc C
+ * with wa + wb + wc = 1 EXACTLY. The former 3x3 Cramer solve did not force the sum to 1; for a triangle seen
+ * nearly edge-on (its plane close to the eye: the step faces in the Deku Palace gardens) the system is
+ * ill-conditioned and float rounding of p pushed the sum off 1 by up to ~1e-2. The model-space piece vertex
+ * sum(w * model) then sits off by (1 - sum w) * (the model origin in clip space), hundreds of units: the piece
+ * stretched into a band of dragged texture that came and went with the camera (the garden "smear").
+ * Barycentrics from the triangle's own edges depend only on its shape, not on where the eye is. */
+static int tri_affine_wgt(const float T[3][3], float px, float py, float pw, float out[3]) {
+    float e1[3], e2[3], d[3], n[3], c1[3], c2[3], nn, l1, l2;
+    int k;
+    for (k = 0; k < 3; k++) {
+        e1[k] = T[1][k] - T[0][k];
+        e2[k] = T[2][k] - T[0][k];
+    }
+    d[0] = px - T[0][0], d[1] = py - T[0][1], d[2] = pw - T[0][2];
+    n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+    l1 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+    l2 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+    if (!(nn > 1e-10f * l1 * l2) || !(nn > 0.0f)) {
+        return 0; /* degenerate (zero-area) triangle */
+    }
+    c1[0] = d[1] * e2[2] - d[2] * e2[1];
+    c1[1] = d[2] * e2[0] - d[0] * e2[2];
+    c1[2] = d[0] * e2[1] - d[1] * e2[0];
+    c2[0] = e1[1] * d[2] - e1[2] * d[1];
+    c2[1] = e1[2] * d[0] - e1[0] * d[2];
+    c2[2] = e1[0] * d[1] - e1[1] * d[0];
+    out[1] = (c1[0] * n[0] + c1[1] * n[1] + c1[2] * n[2]) / nn;
+    out[2] = (c2[0] * n[0] + c2[1] * n[1] + c2[2] * n[2]) / nn;
+    out[0] = 1.0f - out[1] - out[2];
+    return 1;
+}
+
 /* a vertex written to the VBO at `first`: its recipe */
 static void rec_vbo_vertex(int first, const float* d, float px, float py, float pw, int slot) {
     RecVtx* r;
@@ -1590,22 +2427,11 @@ static void rec_vbo_vertex(int first, const float* d, float px, float py, float 
         return;
     }
     if (sRecTriOk) {
-        /* a new vertex (split/clipped): solve p = a A + b B + c C in clip (x, y, w) */
-        const float(*T)[3] = sRecTriPos;
-        float det = T[0][0] * (T[1][1] * T[2][2] - T[2][1] * T[1][2]) - T[1][0] * (T[0][1] * T[2][2] - T[2][1] * T[0][2]) +
-                    T[2][0] * (T[0][1] * T[1][2] - T[1][1] * T[0][2]);
-        if (fabsf(det) > 1e-9f) {
-            float inv = 1.0f / det, P[3] = { px, py, pw };
-            float a = (P[0] * (T[1][1] * T[2][2] - T[2][1] * T[1][2]) - T[1][0] * (P[1] * T[2][2] - T[2][1] * P[2]) +
-                       T[2][0] * (P[1] * T[1][2] - T[1][1] * P[2])) * inv;
-            float b = (T[0][0] * (P[1] * T[2][2] - T[2][1] * P[2]) - P[0] * (T[0][1] * T[2][2] - T[2][1] * T[0][2]) +
-                       T[2][0] * (T[0][1] * P[2] - P[1] * T[0][2])) * inv;
-            float c = 1.0f - a - b;
-            (void)c;
-            c = (T[0][0] * (T[1][1] * P[2] - P[1] * T[1][2]) - T[1][0] * (T[0][1] * P[2] - P[1] * T[0][2]) +
-                 P[0] * (T[0][1] * T[1][2] - T[1][1] * T[0][2])) * inv;
+        /* a new vertex (split/clipped): p = a A + b B + c C in clip (x, y, w), a + b + c = 1 */
+        float w3[3];
+        if (tri_affine_wgt((const float(*)[3])sRecTriPos, px, py, pw, w3)) {
             r->src[0] = sRecTriSrc[0], r->src[1] = sRecTriSrc[1], r->src[2] = sRecTriSrc[2];
-            r->wgt[0] = a, r->wgt[1] = b, r->wgt[2] = c;
+            r->wgt[0] = w3[0], r->wgt[1] = w3[1], r->wgt[2] = w3[2];
         }
     }
 }
@@ -1648,10 +2474,45 @@ static void gpu_rows_from_mp(float rows[4][4], const float mp[4][4], float hx, f
 /* PORT PERF (2026-10-05): MP = MV x P only when vertices need it - a skeleton loads and multiplies several matrices per
  * limb before its vertices (Old 3DS hardware v58: matrices 8% of the drawing; a 4x4 product is 64 VFP multiply-adds) */
 static bool sMPDirty = true;
+/* PORT (2026-10-26): widescreen HUD anchoring moves the anchored HUD's geometry in clip space (x += s * w), not through
+ * the viewport: a left-edge viewport runs past the screen and the PICA kept the hearts, magic and rupees at their 4:3
+ * place (user reports, twice). s turns the shift in pixels into clip units for the current viewport, through the
+ * aspect squeeze the vertex paths apply after the matrix (x' = A * x). */
+/* (a small viewport - the A button's 45 pixels - moves as a viewport instead: shifted in clip space, its geometry left
+ * the viewport's own clip volume and was clipped away. hud_vp_small decides; gfx_sp_tri1_impl shifts such viewports) */
+static int hud_vp_small(void) {
+    return rdp.viewport.width < 0.9f * (float)gfx_current_dimensions.width;
+}
+static float hud_clip_shift(void) {
+    float hs = gfx_hud_shift_px();
+    if (hs == 0.0f || rdp.viewport.width <= 0.0f || hud_vp_small()) {
+        return 0.0f;
+    }
+    return 2.0f * hs / (rdp.viewport.width * gfx_adjust_x_for_aspect_ratio(1.0f));
+}
+static void hud_shift_mp(float mp[4][4]) {
+    float s = hud_clip_shift();
+    /* PORT (2026-11-12): the HUD size setting scales the group toward its corner of the HUD's frame (x = -1 / 1, before
+     * the aspect squeeze; moved by s with the group). A small viewport is scaled as a viewport instead (gfx_sp_tri1). */
+    float k = (rdp.viewport.width > 0.0f && !hud_vp_small()) ? hud_scale() : 1.0f;
+    int i;
+    if (k != 1.0f) {
+        float px = hud_side() + s, py = hud_top() ? 1.0f : -1.0f;
+        for (i = 0; i < 4; i++) {
+            mp[i][0] = k * mp[i][0] + (k * s + (1.0f - k) * px) * mp[i][3];
+            mp[i][1] = k * mp[i][1] + (1.0f - k) * py * mp[i][3];
+        }
+    } else if (s != 0.0f) {
+        for (i = 0; i < 4; i++) {
+            mp[i][0] += s * mp[i][3];
+        }
+    }
+}
 static inline void mp_update(void) {
     if (sMPDirty) {
         sMPDirty = false;
         gfx_matrix_mul(rsp.MP_matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], rsp.P_matrix);
+        hud_shift_mp(rsp.MP_matrix);
     }
 }
 
@@ -1691,6 +2552,7 @@ static int gpu_slot_get(void) {
             if (gPortReplayRec && top >= 0) {
                 float mp[4][4];
                 gfx_matrix_mul(mp, sAltMV[k][top], sAltP[k]);
+                hud_shift_mp(mp);
                 gpu_rows_from_mp(g->rows[k], mp, rsp.half_px_x, rsp.half_px_y, A);
             } else {
                 memcpy(g->rows[k], g->rows[2], sizeof(g->rows[2]));
@@ -1893,6 +2755,9 @@ static void gfx_sp_pop_matrix(uint32_t count) {
             }
         }
     }
+    /* PORT (2026-10-29): the lights' and LookAt's model-space directions follow the modelview, the popped one too
+     * (G_MTX sets this; a pop kept the child's: lighting and environment maps after a pop were in the wrong space) */
+    rsp.lights_changed = 1;
 }
 
 static float gfx_adjust_x_for_aspect_ratio(float x) {
@@ -1902,8 +2767,29 @@ static float gfx_adjust_x_for_aspect_ratio(float x) {
 static uint32_t sPVStamp[MAX_VERTICES + 4]; /* see sPVCache */
 static const int16_t (*sVtxPrev)[3]; /* replay: the previous frame's positions of a skinned load */
 static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *vertices);
+static void gfx_bad_gbi(const char* what, unsigned a, unsigned b) {
+    static int sCount;
+    extern void PortDbgX(const char* label, unsigned val);
+    if (sCount < 8) { /* the first few to boot.log */
+        sCount++;
+        PortDbgX(what, a);
+        PortDbgX("[gbi]   second value", b);
+    }
+}
 static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
     uint64_t t0 = PERF_T();
+    /* PORT (2026-10-26): bounds. F3DZEX2's G_VTX gives n (0..255) and the END slot (0..127); dest = end - n can be past
+     * the 64 vertex slots or negative (a huge size_t). The RSP only wraps inside its DMEM; here every per-slot array
+     * (loaded vertices, caches, replay recipes) was written out of bounds, which overwrote the 60 fps tables' counters
+     * and crashed later (user report: entering the Astral Observatory, gfx_interp_begin_frame). Clamped, logged. */
+    if (dest_index >= MAX_VERTICES || n_vertices == 0 || vertices == NULL) {
+        if (n_vertices != 0) gfx_bad_gbi("[gbi] G_VTX outside the 64 slots: dest", (unsigned)dest_index, (unsigned)n_vertices);
+        return;
+    }
+    if (dest_index + n_vertices > MAX_VERTICES) {
+        gfx_bad_gbi("[gbi] G_VTX past slot 64: dest", (unsigned)dest_index, (unsigned)n_vertices);
+        n_vertices = MAX_VERTICES - dest_index;
+    }
     sVtxPrev = sGrpDepth > 0 && sInterpRecord ? interp_vtx_prev(vertices, n_vertices) : NULL;
     PROF_SET(PROF_VTX);
     gfx_sp_vertex_impl(n_vertices, dest_index, vertices);
@@ -1936,6 +2822,58 @@ static void lights_refresh(void) {
     rsp.lights_changed = false;
 }
 
+/* PORT (2026-10-26): Majora's Mask point lights (F3DZEX2 "PL" microcode). In rooms whose scene enables positional
+ * lights (z_room.c sets G_LIGHTING_POSITIONAL: torches, lamps, glowing objects), z_lights.c binds point lights:
+ * PointLight_t with kc = 8 and a world position. The renderer read them as directional lights, the position's bytes
+ * as a direction, so lit room geometry got wrong, flat or washed-out shading (user report). The intensity below follows
+ * libultraship's Interpreter::GfxSpVertex (MIT, Kenix3 et al.; coefficients from GlideN64), as in 2 Ship 2 Harkinian.
+ * MM's modelview is model -> world (the view is in the projection), so the vertex's world position is MV x ob. */
+#ifdef F3DEX_GBI_PL
+static inline int gfx_point_light(int i, PointLight_t* pl) {
+    memcpy(pl, rsp.current_lights_raw[i], sizeof(PointLight_t));
+    return pl->kc != 0;
+}
+#endif
+/* the current lights include a point light that positional lighting will use (such loads stay off the raw path,
+ * whose shader only knows directional lights) */
+static int gfx_lights_have_point(void) {
+#ifdef F3DEX_GBI_PL
+    if (rsp.geometry_mode & G_LIGHTING_POSITIONAL) {
+        for (int i = 0; i < rsp.current_num_lights - 1; i++) {
+            if (rsp.current_lights_raw[i][3] != 0) { /* PointLight_t.kc */
+                return 1;
+            }
+        }
+    }
+#endif
+    return 0;
+}
+#ifdef F3DEX_GBI_PL
+static float gfx_point_light_intensity(const PointLight_t* pl, const float wp[3], const Vtx_tn* vn) {
+    const float(*mtx)[4] = rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1];
+    float dv[3] = { pl->pos[0] - wp[0], pl->pos[1] - wp[1], pl->pos[2] - wp[2] };
+    float distSq = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2] * 2.0f; /* (the * 2 is GlideN64's) */
+    float lm[3], total, distf, atten;
+    int k;
+    if (distSq < 1.0f) {
+        distSq = 1.0f;
+    }
+    /* the light vector in the model's space (transposed modelview, like calculate_normal_dir) */
+    lm[0] = dv[0] * mtx[0][0] + dv[1] * mtx[0][1] + dv[2] * mtx[0][2];
+    lm[1] = dv[0] * mtx[1][0] + dv[1] * mtx[1][1] + dv[2] * mtx[1][2];
+    lm[2] = dv[0] * mtx[2][0] + dv[1] * mtx[2][1] + dv[2] * mtx[2][2];
+    for (k = 0; k < 3; k++) {
+        lm[k] = 4.0f * lm[k] / distSq;
+        lm[k] = lm[k] < -1.0f ? -1.0f : (lm[k] > 1.0f ? 1.0f : lm[k]);
+    }
+    total = lm[0] * vn->n[0] + lm[1] * vn->n[1] + lm[2] * vn->n[2];
+    total = total < -1.0f ? -1.0f : (total > 1.0f ? 1.0f : total);
+    distf = floorf(sqrtf(distSq));
+    atten = (distf * pl->kl * 2.0f + distf * distf * pl->kq / 8.0f) / 65535.0f + 1.0f;
+    return total / atten;
+}
+#endif
+
 /* shade colour (lighting, or the vertex colour) and texture coordinates (texgen, or the vertex's), shared
  * by the CPU and GPU vertex paths; alpha and position are each path's */
 static inline __attribute__((always_inline)) void vtx_shade(const Vtx_t* v, const Vtx_tn* vn, struct LoadedVertex* d,
@@ -1953,8 +2891,32 @@ static inline __attribute__((always_inline)) void vtx_shade(const Vtx_t* v, cons
         int g = rsp.current_lights[rsp.current_num_lights - 1].col[1];
         int b = rsp.current_lights[rsp.current_num_lights - 1].col[2];
 
+#ifdef F3DEX_GBI_PL
+        const int positional = (rsp.geometry_mode & G_LIGHTING_POSITIONAL) != 0;
+        float wp[3];
+        int wpDone = 0;
+#endif
         for (int i = 0; i < rsp.current_num_lights - 1; i++) {
             float intensity = 0;
+#ifdef F3DEX_GBI_PL
+            PointLight_t pl;
+            if (positional && gfx_point_light(i, &pl)) {
+                if (!wpDone) {
+                    const float(*mv)[4] = rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1];
+                    for (int k = 0; k < 3; k++) {
+                        wp[k] = v->ob[0] * mv[0][k] + v->ob[1] * mv[1][k] + v->ob[2] * mv[2][k] + mv[3][k];
+                    }
+                    wpDone = 1;
+                }
+                intensity = gfx_point_light_intensity(&pl, wp, vn);
+                if (intensity > 0.0f) {
+                    r += intensity * pl.col[0];
+                    g += intensity * pl.col[1];
+                    b += intensity * pl.col[2];
+                }
+                continue;
+            }
+#endif
             intensity += vn->n[0] * rsp.current_lights_coeffs[i][0];
             intensity += vn->n[1] * rsp.current_lights_coeffs[i][1];
             intensity += vn->n[2] * rsp.current_lights_coeffs[i][2];
@@ -2031,6 +2993,10 @@ typedef struct {
 #define RAW_LIGHT_SETS 64
 static const Vtx* sLoadRaw[MAX_VERTICES + 4];   /* the game's vertex behind a loaded slot (raw path), NULL: processed */
 static uint8_t sLoadLit[MAX_VERTICES + 4];       /* its light set + 1, 0 = unlit */
+/* PORT (2026-11-10): 1 = the raw load's bounding box reaches past the guard band (gfx_sp_vertex_gpu): its triangles are
+ * checked one by one before going out raw (raw_tri_in_guard) */
+static uint8_t sRawGuard[MAX_VERTICES + 4];
+#define PORT_RAW_GUARD 0 /* (2026-11-11: off again with room culling back on - see gpu_tri_state; kept for the record) */
 /* PORT PERF (2026-10-05): the Old 3DS speed rules (settings speed_rules, 3ds_main.c). Every load stays raw and every
  * triangle goes to the GPU: no N64 NoN depth clamp (the PICA clips at the near plane itself, as 3DS games do: shaders'
  * remap.z, gfx_citro3d.c setRemap), no CPU clipping, no splits for the RDP's screen-linear shading. The per-triangle CPU
@@ -2058,6 +3024,8 @@ extern void* gfx_citro3d_raw_vbo(int** pos, u32* cap);
 /* the current lights as a raw light set (+1); 0 when they do not fit (the load stays on the processed path).
  * cam: in camera space (PORT PERF 2026-10-05) - the same set for every limb of a model, so its draws and limb seams stay
  * on the GPU; else in the load's model space as the N64 transforms them (non-uniformly scaled matrices). */
+extern int gPortGDbg;
+#define DBG_CPUM (gPortGDbg == 6 || gPortGDbg == 8 || gPortGDbg == 9 || gPortGDbg == 17 || gPortGDbg == 18 || gPortGDbg == 21 || gPortGDbg == 22 || gPortGDbg == 23 || gPortGDbg == 24) /* TEMPORARY Ground debug: blend draws on the CPU route */
 static int raw_light_set(int cam) {
     RawLights L;
     int i, k, n = rsp.current_num_lights - 1;
@@ -2148,6 +3116,8 @@ static void gfx_sp_vertex_gpu(size_t n_vertices, size_t dest_index, const Vtx* v
     const uint16_t slot = (uint16_t)gpu_slot_get(); /* one matrix state for the whole load */
     uint8_t rej = 0;
     int nearEye = 0; /* the raw path: the load reaches the eye's neighbourhood */
+    int guardRisk = 0; /* the raw path: the load's box reaches past the guard band (sRawGuard) */
+    float dlogBox[6] = { 0, 0, 0, 0, 0, 0 }; /* (TEMPORARY draw log: the load's model-space box) */
     PROF_SET(PROF_VTX_BOX);
     {
         /* PORT PERF (2026-10-01): off-screen rejection for the whole load. The GPU path doesn't transform
@@ -2176,6 +3146,7 @@ static void gfx_sp_vertex_gpu(size_t n_vertices, size_t dest_index, const Vtx* v
         }
         for (k = 0; k < 3; k++) {
             mn[k] = (float)imn[k], mx[k] = (float)imx[k];
+            dlogBox[k] = mn[k], dlogBox[3 + k] = mx[k];
         }
         /* PORT (2026-10-03): the slot's output rows (y', -x', -(z + w) / 2, w: half-pixel offset and aspect
          * included) for the logic frame and, when the walk records 60 fps in-between frames, for the t = 1/3 and
@@ -2234,6 +3205,34 @@ static void gfx_sp_vertex_gpu(size_t n_vertices, size_t dest_index, const Vtx* v
 #endif
                 }
             }
+            /* PORT (2026-11-10): raw triangles reach the PICA as they are, unclipped, and a vertex far outside the screen
+             * overflows its raster range (the processed path keeps every triangle inside the RSP's guard band, x and y
+             * within +-2 w, for that reason - gpu_emit_tri). A load that is neither near the eye nor deep can still run far
+             * past the screen: Milk Road's tall rock walls, a short way to the side of the camera, reach many screen
+             * heights above it. Such a load went raw or processed as its box crossed the near/deep thresholds, and the
+             * wall vanished, whole or in part, coming back with small camera turns - for seconds while Link stood still
+             * (user videos at 20 and 60 fps; in the vanish log the room's 16-triangle entries switch between 16 raw
+             * triangles and ~200 clipped pieces from one frame to the next). A load whose box reaches past the guard band
+             * now has its triangles checked one at a time (raw_tri_in_guard): those inside it stay raw, the others are
+             * drawn processed and clipped on the CPU, like every other triangle that leaves the guard band. */
+            if (!nearEye && PORT_RAW_GUARD) {
+                const float gr = rsp.clip_ratio ? (float)rsp.clip_ratio : 2.0f;
+                for (t = k0; t <= 2 && !guardRisk; t++) {
+                    const float(*r)[4] = (const float(*)[4])sGpuSlot[slot].rows[t];
+                    /* the largest of y' - gr w, -y' - gr w, -x' - gr w, x' - gr w over the box (each linear: per-axis ends) */
+                    float d0 = r[0][3] - gr * r[3][3], d1 = -r[0][3] - gr * r[3][3];
+                    float d2 = r[1][3] - gr * r[3][3], d3 = -r[1][3] - gr * r[3][3];
+                    for (k = 0; k < 3; k++) {
+                        const float c0 = r[0][k] - gr * r[3][k], c1 = -r[0][k] - gr * r[3][k];
+                        const float c2 = r[1][k] - gr * r[3][k], c3 = -r[1][k] - gr * r[3][k];
+                        d0 += c0 > 0.0f ? c0 * mx[k] : c0 * mn[k];
+                        d1 += c1 > 0.0f ? c1 * mx[k] : c1 * mn[k];
+                        d2 += c2 > 0.0f ? c2 * mx[k] : c2 * mn[k];
+                        d3 += c3 > 0.0f ? c3 * mx[k] : c3 * mn[k];
+                    }
+                    guardRisk = d0 > 0.0f || d1 > 0.0f || d2 > 0.0f || d3 > 0.0f;
+                }
+            }
         }
     }
     {
@@ -2254,11 +3253,17 @@ static void gfx_sp_vertex_gpu(size_t n_vertices, size_t dest_index, const Vtx* v
         if (nearEye) {
             raw = 0; /* (see nearEye) */
         }
+        if (gPortGDbg == 10 && sInRoomDl) {
+            raw = 0; /* TEMPORARY test: the room's vertices lit and transformed on the CPU (the N64's own way) */
+        }
 #ifdef PORT_ICONGEN
         if (mesh_capturing()) {
             raw = 0; /* (the mesh capture reads the CPU's colours and texture coordinates) */
         }
 #endif
+        if (raw && (rsp.geometry_mode & G_LIGHTING) && gfx_lights_have_point()) {
+            raw = 0; /* point lights: lit on the CPU (vtx_shade), the raw shader only has directional ones */
+        }
         if (raw && (rsp.geometry_mode & G_LIGHTING)) {
             lit = raw_light_set(sGpuSlot[slot].camLit);
             raw = lit != 0;
@@ -2275,6 +3280,39 @@ static void gfx_sp_vertex_gpu(size_t n_vertices, size_t dest_index, const Vtx* v
             if (raw) gPortRawWhy[7] += n_vertices;
         }
 #endif
+        if (sDrawTxt != NULL) { /* (TEMPORARY draw log) the load: route, and its box's w range in the logic frame */
+            float wlo = 0.0f, whi = 0.0f, o2hi = 0.0f, gmax = 0.0f;
+            int kk;
+            if (slot != GPU_SLOT_IDENTITY && slot < sGpuSlotN) {
+                const float(*r)[4] = (const float(*)[4])sGpuSlot[slot].rows[2];
+                const float gr = rsp.clip_ratio ? (float)rsp.clip_ratio : 2.0f;
+                float d0 = r[0][3] - gr * r[3][3], d1 = -r[0][3] - gr * r[3][3];
+                float d2 = r[1][3] - gr * r[3][3], d3 = -r[1][3] - gr * r[3][3];
+                wlo = whi = r[3][3], o2hi = r[2][3];
+                for (kk = 0; kk < 3; kk++) {
+                    float a = r[3][kk] * dlogBox[kk], b = r[3][kk] * dlogBox[3 + kk];
+                    float e = r[2][kk] * dlogBox[kk], f = r[2][kk] * dlogBox[3 + kk];
+                    float c0 = r[0][kk] - gr * r[3][kk], c1 = -r[0][kk] - gr * r[3][kk];
+                    float c2 = r[1][kk] - gr * r[3][kk], c3 = -r[1][kk] - gr * r[3][kk];
+                    wlo += a < b ? a : b;
+                    whi += a < b ? b : a;
+                    o2hi += e < f ? f : e;
+                    d0 += c0 > 0.0f ? c0 * dlogBox[3 + kk] : c0 * dlogBox[kk];
+                    d1 += c1 > 0.0f ? c1 * dlogBox[3 + kk] : c1 * dlogBox[kk];
+                    d2 += c2 > 0.0f ? c2 * dlogBox[3 + kk] : c2 * dlogBox[kk];
+                    d3 += c3 > 0.0f ? c3 * dlogBox[3 + kk] : c3 * dlogBox[kk];
+                }
+                gmax = d0 > d1 ? d0 : d1;
+                gmax = d2 > gmax ? d2 : gmax;
+                gmax = d3 > gmax ? d3 : gmax;
+            }
+            fprintf(sDrawTxt, "V n=%u dest=%u slot=%u raw=%d near=%d guard=%d rej=%02x lit=%d w=%.1f..%.1f o2hi=%.1f gmax=%.1f "
+                              "box=%.0f,%.0f,%.0f..%.0f,%.0f,%.0f gm=%08x src=%p\n",
+                    (unsigned)n_vertices, (unsigned)dest_index, (unsigned)slot, raw, nearEye, guardRisk, (unsigned)rej, lit,
+                    (double)wlo, (double)whi, (double)o2hi, (double)gmax, (double)dlogBox[0], (double)dlogBox[1],
+                    (double)dlogBox[2], (double)dlogBox[3], (double)dlogBox[4], (double)dlogBox[5],
+                    (unsigned)rsp.geometry_mode, (const void*)vertices);
+        }
         if (raw) {
             PROF_SET(PROF_VTX_RAW);
             for (size_t i = 0; i < n_vertices; i++, dest_index++) {
@@ -2287,6 +3325,7 @@ static void gfx_sp_vertex_gpu(size_t n_vertices, size_t dest_index, const Vtx* v
                 sZWStale[dest_index] = 1;
                 sLoadRaw[dest_index] = &vertices[i];
                 sLoadLit[dest_index] = (uint8_t)lit;
+                sRawGuard[dest_index] = (uint8_t)guardRisk;
                 d->x = v->ob[0], d->y = v->ob[1], d->z = v->ob[2], d->w = 1.0f; /* (G_BRANCH_Z, rectangles' neighbours) */
                 d->clip_rej = rej;
             }
@@ -2507,6 +3546,7 @@ int gPortShadeSplit = 1;
 extern float* gfx_citro3d_vtx_reserve(u32 n, u32* first);
 extern void gfx_citro3d_vtx_write(float* dst, const float* src);
 extern int gfx_citro3d_idx_push(u32 a, u32 b, u32 c);
+extern int gfx_citro3d_idx_push_piece(u32 a, u32 b, u32 c);
 extern void gfx_citro3d_draw_indexed(void);
 
 extern float* gfx_citro3d_vbo_info(int** pos, u32* cap, float scale[4]);
@@ -2584,7 +3624,91 @@ static void tj_add(float x0, float y0, float x1, float y1, float x2, float y2, i
     sTjN++;
 }
 #endif
-static void gfx_pack_tri(const PVtx* t[3], bool z_is_from_0_to_1) {
+extern int gPortGDbg;
+static int uv_rebase(const PVtx* t[3], PVtx rb[3], const PVtx* out[3]);
+static int dbg_is_blend(void);
+static void pvtx_mid_screen(const PVtx* a, const PVtx* b, PVtx* m);
+static int sDbgInSub;
+static uint32_t sDbgTriHash; /* TEMPORARY: mode 24 TINT TRIS - hash of the triangle's source texture coordinates (gfx_sp_tri1_impl) */
+/* TEMPORARY Ground debug test (mode 21): the triangle grown outward by ~0.9 N64 px on every side, attributes extrapolated
+ * (perspective-correct), so neighbours overlap and no pixel crack between them can show what is behind */
+static void dbg_fatten(const PVtx* t[3], PVtx o[3]) {
+    float sx[3], sy[3], cx, cy, det;
+    int i, j;
+    for (i = 0; i < 3; i++) {
+        o[i] = *t[i];
+        if (t[i]->w <= 1e-3f) return;
+        sx[i] = t[i]->x / t[i]->w, sy[i] = t[i]->y / t[i]->w;
+    }
+    cx = (sx[0] + sx[1] + sx[2]) / 3.0f, cy = (sy[0] + sy[1] + sy[2]) / 3.0f;
+    det = (sy[1] - sy[2]) * (sx[0] - sx[2]) + (sx[2] - sx[1]) * (sy[0] - sy[2]);
+    if (fabsf(det) < 1e-12f) return;
+    for (i = 0; i < 3; i++) {
+        float dx = sx[i] - cx, dy = sy[i] - cy, len = sqrtf(dx * dx * 160.0f * 160.0f + dy * dy * 120.0f * 120.0f);
+        float nx, ny, b[3], q, wn, p[3];
+        if (len < 1e-6f) continue;
+        nx = cx + dx * ((len + 0.9f) / len), ny = cy + dy * ((len + 0.9f) / len);
+        b[0] = ((sy[1] - sy[2]) * (nx - sx[2]) + (sx[2] - sx[1]) * (ny - sy[2])) / det;
+        b[1] = ((sy[2] - sy[0]) * (nx - sx[2]) + (sx[0] - sx[2]) * (ny - sy[2])) / det;
+        b[2] = 1.0f - b[0] - b[1];
+        q = b[0] / t[0]->w + b[1] / t[1]->w + b[2] / t[2]->w;
+        if (q <= 1e-9f) continue;
+        wn = 1.0f / q;
+        for (j = 0; j < 3; j++) p[j] = b[j] / t[j]->w * wn;
+        o[i].w = wn;
+        o[i].x = nx * wn, o[i].y = ny * wn;
+        o[i].z = p[0] * t[0]->z + p[1] * t[1]->z + p[2] * t[2]->z;
+        o[i].s = p[0] * t[0]->s + p[1] * t[1]->s + p[2] * t[2]->s;
+        for (j = 0; j < 4; j++) {
+            o[i].uv[j >> 1][j & 1] = p[0] * t[0]->uv[j >> 1][j & 1] + p[1] * t[1]->uv[j >> 1][j & 1] + p[2] * t[2]->uv[j >> 1][j & 1];
+            o[i].c[j] = b[0] * t[0]->c[j] + b[1] * t[1]->c[j] + b[2] * t[2]->c[j];
+        }
+    }
+}
+static void gfx_pack_tri(const PVtx* t_in[3], bool z_is_from_0_to_1) {
+    PVtx rbv[3];
+    const PVtx* rbp[3];
+    PVtx dbgv[3];
+    const PVtx* dbgp[3];
+    if (gPortGDbg == 24 && dbg_is_blend()) { /* TEMPORARY: every source triangle of the ground draw in one of 6 flat colours */
+        static const float kCol[6][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 1, 1, 0 }, { 0, 1, 1 }, { 1, 0, 1 } };
+        const float* c6 = kCol[(sDbgTriHash >> 8) % 6u];
+#ifdef __3DS__
+        sCurVidx = NULL;
+#endif
+        for (int i = 0; i < 3; i++) {
+            dbgv[i] = *t_in[i];
+            dbgv[i].c[0] = c6[0], dbgv[i].c[1] = c6[1], dbgv[i].c[2] = c6[2];
+            dbgp[i] = &dbgv[i];
+        }
+        t_in = dbgp;
+    }
+    if ((gPortGDbg == 17 || gPortGDbg == 21 || gPortGDbg == 23) && !sDbgInSub && dbg_is_blend()) { /* TEMPORARY Ground debug tests */
+#ifdef __3DS__
+        sCurVidx = NULL; /* new vertices */
+#endif
+        if (gPortGDbg == 21 || gPortGDbg == 23) {
+            dbg_fatten(t_in, dbgv);
+            for (int i = 0; i < 3; i++) dbgp[i] = &dbgv[i];
+            t_in = dbgp;
+        }
+        if (gPortGDbg == 17) { /* every vertex gets the first one's texture coordinates: no UV interpolation at all */
+            for (int i = 0; i < 3; i++) {
+                dbgv[i] = *t_in[i];
+                memcpy(dbgv[i].uv, t_in[0]->uv, sizeof(dbgv[i].uv));
+                dbgp[i] = &dbgv[i];
+            }
+            t_in = dbgp;
+        }
+    }
+    const PVtx** tp = t_in;
+    if (gPortGDbg == 6 && uv_rebase(t_in, rbv, rbp)) {
+        tp = rbp;
+#ifdef __3DS__
+        sCurVidx = NULL; /* new vertices */
+#endif
+    }
+    const PVtx* t[3] = { tp[0], tp[1], tp[2] };
     if (buf_vbo_num_tris == MAX_BUFFERED) {
         gfx_flush();
     }
@@ -2832,7 +3956,20 @@ static void gfx_emit_tri(const PVtx* a, const PVtx* b, const PVtx* c, bool zf) {
     }
 }
 
+static int dbg_is_blend(void);
+static void gfx_emit_tri_one_impl(const PVtx* a, const PVtx* b, const PVtx* c, bool zf);
 static void gfx_emit_tri_one(const PVtx* a, const PVtx* b, const PVtx* c, bool zf) {
+    if ((gPortGDbg == 18 || gPortGDbg == 22) && dbg_is_blend()) { /* TEMPORARY Ground debug: this draw's triangles cut small (crack-free, per edge) */
+        float sr = gPortSplitRatio, sm = gPortSplitMinPx;
+        int sd = gPortSplitDepth;
+        gPortSplitRatio = 1.01f, gPortSplitMinPx = 16.0f, gPortSplitDepth = 5;
+        gfx_emit_tri_one_impl(a, b, c, zf);
+        gPortSplitRatio = sr, gPortSplitMinPx = sm, gPortSplitDepth = sd;
+        return;
+    }
+    gfx_emit_tri_one_impl(a, b, c, zf);
+}
+static void gfx_emit_tri_one_impl(const PVtx* a, const PVtx* b, const PVtx* c, bool zf) {
     const PVtx* t[3] = { a, b, c };
     PVtx poly[9], tmp[9];
     int n = 0;
@@ -2840,6 +3977,17 @@ static void gfx_emit_tri_one(const PVtx* a, const PVtx* b, const PVtx* c, bool z
      * use ratio 1 = the screen edges): the new edge vertices get attributes interpolated in clip
      * space, and only between those does the RDP interpolate linearly. */
     float r = rsp.clip_ratio ? (float)rsp.clip_ratio : 2.0f;
+#ifdef __3DS__
+    /* PORT (2026-11-12, Milk Road wall): pieces are clipped a little past the screen edges (1.25 w; 1.5 w while recording
+     * for 60 fps, where the in-between cameras turn a little further) instead of at the RSP's guard band (2 w): the PICA's
+     * rasteriser drops pieces reaching far past the screen (the wall vanished at some camera angles; it came back when
+     * this was removed on 2026-11-14, user photo). The edges cut here are off screen either way. */
+    {
+        const float e = gPortReplayRec ? 1.5f : 1.25f;
+        r = r > e ? e : r;
+    }
+#endif
+    if ((gPortGDbg == 8 || gPortGDbg == 9) && dbg_is_blend()) r = gPortGDbg == 8 ? 1.25f : 3.0f; /* TEMPORARY test */
     bool outside = false;
     for (int i = 0; i < 3; i++) {
         const PVtx* p = t[i];
@@ -2919,6 +4067,7 @@ static void gfx_emit_tri_one(const PVtx* a, const PVtx* b, const PVtx* c, bool z
         memcpy(poly, tmp, sizeof(PVtx) * m);
         n = m;
     }
+    if (n < 3 && sDrawTxt != NULL) fprintf(sDrawTxt, "X clipped away (nothing left inside the guard band)\n"); /* (TEMPORARY) */
     for (int i = 0; i < n; i++) {
         pvtx_clamp_near(&poly[i]);
     }
@@ -2937,6 +4086,7 @@ static void* sDrawTarget; /* NULL = screen */
 static bool sTargetDirty = true;
 static void gfx_apply_viewport(void);
 static void gfx_apply_scissor(void);
+static float sScreenScale = 1.0f; /* the end-of-day shrink (see WIDE_ACTIVE) */
 static void gfx_select_target_slow(void);
 static inline void gfx_select_target(void) {
     if (sTargetDirty) {
@@ -2990,6 +4140,36 @@ static struct {
     bool linear_filter;
     bool z_is_from_0_to_1;
 } sTC;
+
+/* PORT (2026-11-01, TEMPORARY test): texture coordinates that run far from 0 (the garden ground blend: tile 1 is
+ * magnified x4 by its shift) lose precision on the GPU, or leave the range its wrap handles; shift a triangle's
+ * coordinates back by a whole number of repeats (2 for mirrored) so they stay small. Clamped axes are left alone. */
+static int uv_rebase(const PVtx* t[3], PVtx rb[3], const PVtx* out[3]) {
+    int changed = 0, k, a, i;
+    for (i = 0; i < 3; i++) {
+        rb[i] = *t[i];
+        out[i] = &rb[i];
+    }
+    for (k = 0; k < 2; k++) {
+        if (!sTC.used_textures[k] || sTC.utile[k] == NULL) continue;
+        for (a = 0; a < 2; a++) {
+            int cm = a == 0 ? sTC.utile[k]->cms : sTC.utile[k]->cmt;
+            float mx = 0.0f, m, per, base;
+            if (cm & 2) continue;
+            for (i = 0; i < 3; i++) {
+                float v = fabsf(t[i]->uv[k][a]);
+                mx = v > mx ? v : mx;
+            }
+            if (mx < 8.0f) continue;
+            m = (t[0]->uv[k][a] + t[1]->uv[k][a] + t[2]->uv[k][a]) * (1.0f / 3.0f);
+            per = (cm & 1) ? 2.0f : 1.0f;
+            base = floorf(m / per) * per;
+            for (i = 0; i < 3; i++) rb[i].uv[k][a] -= base;
+            changed = 1;
+        }
+    }
+    return changed;
+}
 
 #ifdef __3DS__
 /* ---- GPU vertex path: triangles (see the slot table above) ---- */
@@ -3048,6 +4228,10 @@ static void gpu_send_params(void) {
 static int gpu_tri_state(void) {
     int cull = (rsp.geometry_mode & G_CULL_BOTH) >> 9; /* 1 front, 2 back, 3 both */
     int fogOn = (rsp.geometry_mode & G_FOG) != 0;
+    /* PORT (2026-11-11): room geometry drawn without face culling (for Milk Road's vanishing road) was taken out again: the
+     * straw roofs in Clock Town shimmered and looked distorted with it (user report) - surfaces made two-sided by stacking
+     * a reversed copy in the same place draw both copies at the same depth then. Culling stays as the N64 has it. */
+    if ((gPortGDbg == 19 || gPortGDbg == 23) && dbg_is_blend()) fogOn = 0; /* TEMPORARY Ground debug test: no fog on the ground draw */
     float conv = stereo_conv();
     if (cull == 3) {
         return 0; /* the CPU path drew nothing either */
@@ -3122,31 +4306,39 @@ static float sPieceClip[3][3];  /* x, y, w of the source vertices (the PVtx spac
 static float sPieceModel[3][3]; /* their model-space positions */
 static float sPieceDpos[3][3];  /* their skinned deltas toward the previous frame */
 
+/* clip w (camera-space depth) below which a piece vertex stays in clip space. (2026-11-12: keeping all of them in clip
+ * space was tried for the Milk Road wall; it made the ground judder at 60 fps and was not needed - user test.) */
+#define PIECE_MODEL_MIN_W 16.0f
+/* (TEMPORARY, 2026-11-11) triangles dropped because one of the frame's buffers was full: 0 the GPU-path vertex buffer,
+ * 1 the raw vertex buffer, 2 the index buffer (reported at the next frame's start: boot.log and the draw log) */
+u32 gPortDropTris[3];
+static void drop_note(int k) {
+    gPortDropTris[k]++;
+    if (sDrawTxt != NULL) fprintf(sDrawTxt, "X dropped: %s full\n", k == 0 ? "vbo" : k == 1 ? "raw vbo" : "index buffer");
+}
+/* (TEMPORARY draw log) the PICA's 24-bit floats (16-bit mantissa), to check a piece rebuilt in model space */
+static float dlog_f24(float v) {
+    union {
+        float f;
+        uint32_t u;
+    } x;
+    x.f = v;
+    x.u = (x.u + 0x40u) & ~0x7Fu;
+    return x.f;
+}
 static void gpu_pack_clip_tri(const PVtx* t[3]) {
     int i, ix[3], pal = gpu_pal_index(GPU_SLOT_IDENTITY), spal = -1;
     float wgt[3][3];
+    float dlogM[3][3]; /* (TEMPORARY draw log) the model-space position written for each vertex */
     if (pal < 0) {
         pal = gpu_pal_add(GPU_SLOT_IDENTITY); /* the caller made room */
     }
     if (sPieceSrcOk) {
-        /* weights of each piece vertex: solve p = a A + b B + c C in (x, y, w) (Cramer's rule) */
-        const float(*m)[3] = sPieceClip;
-        float det = m[0][0] * (m[1][1] * m[2][2] - m[2][1] * m[1][2]) - m[1][0] * (m[0][1] * m[2][2] - m[2][1] * m[0][2]) +
-                    m[2][0] * (m[0][1] * m[1][2] - m[1][1] * m[0][2]);
+        /* weights of each piece vertex: p = a A + b B + c C in (x, y, w) with a + b + c = 1 (tri_affine_wgt) */
         spal = gpu_pal_index(sPieceSlot);
-        if (fabsf(det) < 1e-9f || spal < 0) {
-            spal = -1;
-        } else {
-            float inv = 1.0f / det;
-            for (i = 0; i < 3; i++) {
-                float px = t[i]->x, py = t[i]->y, pw = t[i]->w;
-                /* columns: A = m[0], B = m[1], C = m[2] (each x, y, w) */
-                wgt[i][0] = (px * (m[1][1] * m[2][2] - m[2][1] * m[1][2]) - m[1][0] * (py * m[2][2] - m[2][1] * pw) +
-                             m[2][0] * (py * m[1][2] - m[1][1] * pw)) * inv;
-                wgt[i][1] = (m[0][0] * (py * m[2][2] - m[2][1] * pw) - px * (m[0][1] * m[2][2] - m[2][1] * m[0][2]) +
-                             m[2][0] * (m[0][1] * pw - py * m[0][2])) * inv;
-                wgt[i][2] = (m[0][0] * (m[1][1] * pw - py * m[1][2]) - m[1][0] * (m[0][1] * pw - py * m[0][2]) +
-                             px * (m[0][1] * m[1][2] - m[1][1] * m[0][2])) * inv;
+        for (i = 0; i < 3 && spal >= 0; i++) {
+            if (!tri_affine_wgt((const float(*)[3])sPieceClip, t[i]->x, t[i]->y, t[i]->w, wgt[i])) {
+                spal = -1;
             }
         }
     }
@@ -3160,13 +4352,20 @@ static void gpu_pack_clip_tri(const PVtx* t[3]) {
         GpuVtx tv, *d = &tv; /* built here, then one block store into the vertex buffer (see gpu_emit_tri) */
         int k;
         if (sGpuVbo == NULL || (u32)*sGpuVboPos >= sGpuVboCap) {
+            drop_note(0);
             return;
         }
         ix[i] = (*sGpuVboPos)++;
-        if (spal >= 0) { /* model space with the source's palette entry (z clamps at the near plane in the shader) */
+        /* PORT (2026-11-07): a piece vertex at (or near) the eye plane - where a floor or wall that runs past the camera is
+         * cut (the w = 0.001 plane in gfx_emit_tri_one_impl) - stays in clip space. Rebuilt in model space, the GPU had to
+         * get its w back from world coordinates in the thousands with 24-bit floats: w = 0.001 came out a few tenths
+         * either side of 0, the piece turned over and was culled, and a whole stretch of floor vanished into the clear
+         * colour (hardware video, the opening area, 2026-11-07). The eye-plane end of a piece is off screen anyway. */
+        if (spal >= 0 && p->w >= PIECE_MODEL_MIN_W) { /* model space with the source's palette entry (z clamps at the near plane in the shader) */
             for (k = 0; k < 3; k++) {
                 d->pos[k] = wgt[i][0] * sPieceModel[0][k] + wgt[i][1] * sPieceModel[1][k] + wgt[i][2] * sPieceModel[2][k];
                 d->dpos[k] = wgt[i][0] * sPieceDpos[0][k] + wgt[i][1] * sPieceDpos[1][k] + wgt[i][2] * sPieceDpos[2][k];
+                dlogM[i][k] = d->pos[k];
             }
             d->pos[3] = 1.0f;
             d->dpos[3] = 1.0f; /* shade alpha already holds the N64 fog factor */
@@ -3188,7 +4387,32 @@ static void gpu_pack_clip_tri(const PVtx* t[3]) {
         tv.pad[0] = tv.pad[1] = tv.pad[2] = 0;
         memcpy(&sGpuVbo[ix[i]], &tv, sizeof(tv));
     }
-    if (!gfx_citro3d_idx_push(ix[0], ix[1], ix[2])) {
+    if (sDrawTxt != NULL) { /* (TEMPORARY draw log) a piece as sent: clip x y w, m = model space (source palette) */
+        fprintf(sDrawTxt, "P %.2f %.2f %.3f%s %.2f %.2f %.3f%s %.2f %.2f %.3f%s pal=%d spal=%d ix=%d,%d,%d\n", (double)t[0]->x,
+                (double)t[0]->y, (double)t[0]->w, (spal >= 0 && t[0]->w >= PIECE_MODEL_MIN_W) ? "m" : "c", (double)t[1]->x,
+                (double)t[1]->y, (double)t[1]->w, (spal >= 0 && t[1]->w >= PIECE_MODEL_MIN_W) ? "m" : "c", (double)t[2]->x,
+                (double)t[2]->y, (double)t[2]->w, (spal >= 0 && t[2]->w >= PIECE_MODEL_MIN_W) ? "m" : "c", pal, spal, ix[0], ix[1],
+                ix[2]);
+        for (i = 0; i < 3; i++) { /* a model-space vertex: where the GPU puts it (float32, then 24-bit floats) */
+            if (spal >= 0 && t[i]->w >= PIECE_MODEL_MIN_W) {
+                const float(*r)[4] = gpu_rows2(sPieceSlot);
+                float g[4], h[4];
+                int k;
+                for (k = 0; k < 4; k++) {
+                    g[k] = r[k][0] * dlogM[i][0] + r[k][1] * dlogM[i][1] + r[k][2] * dlogM[i][2] + r[k][3];
+                    h[k] = dlog_f24(dlog_f24(dlog_f24(dlog_f24(dlog_f24(r[k][0]) * dlog_f24(dlogM[i][0])) +
+                                                      dlog_f24(dlog_f24(r[k][1]) * dlog_f24(dlogM[i][1]))) +
+                                             dlog_f24(dlog_f24(r[k][2]) * dlog_f24(dlogM[i][2]))) +
+                                    dlog_f24(r[k][3]));
+                }
+                fprintf(sDrawTxt, "M %d model=%.2f,%.2f,%.2f wgt=%.4f,%.4f,%.4f gpu32=%.2f %.2f %.3f gpu24=%.2f %.2f %.3f\n", i,
+                        (double)dlogM[i][0], (double)dlogM[i][1], (double)dlogM[i][2], (double)wgt[i][0], (double)wgt[i][1],
+                        (double)wgt[i][2], (double)-g[1], (double)g[0], (double)g[3], (double)-h[1], (double)h[0], (double)h[3]);
+            }
+        }
+    }
+    if (!gfx_citro3d_idx_push_piece(ix[0], ix[1], ix[2])) {
+        drop_note(2);
         return;
     }
     buf_vbo_len = buf_vbo_len ? buf_vbo_len : 1;
@@ -3255,12 +4479,14 @@ static void gpu_emit_cpu(const uint8_t vidx[3], const uint16_t sl[3]) {
             rej &= r;
         }
         if (rej) {
+            if (sDrawTxt != NULL) fprintf(sDrawTxt, "Q rejected %02x\n", (unsigned)rej); /* (TEMPORARY draw log) */
             return;
         }
         if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
             float cross = -(pv[0].x * (pv[1].y * pv[2].w - pv[2].y * pv[1].w) - pv[1].x * (pv[0].y * pv[2].w - pv[2].y * pv[0].w) +
                             pv[2].x * (pv[0].y * pv[1].w - pv[1].y * pv[0].w));
             if ((rsp.geometry_mode & G_CULL_BOTH) == G_CULL_FRONT ? cross <= 0 : cross >= 0) {
+                if (sDrawTxt != NULL) fprintf(sDrawTxt, "Q culled %g\n", (double)cross); /* (TEMPORARY draw log) */
                 return;
             }
         }
@@ -3375,6 +4601,7 @@ static void gpu_emit_tri_raw(const uint8_t vidx[3]) {
             continue;
         }
         if (sRawVboP == NULL || (u32)*sRawPosP >= sRawCapN) {
+            drop_note(1);
             return; /* this frame's raw vertex buffer is full */
         }
         ix[i] = (*sRawPosP)++;
@@ -3392,6 +4619,7 @@ static void gpu_emit_tri_raw(const uint8_t vidx[3]) {
         sBatchStamp[slot] = sBatchId;
     }
     if (!gfx_citro3d_idx_push(ix[0], ix[1], ix[2])) {
+        drop_note(2);
         return;
     }
     gPortPerfRawTris++;
@@ -3449,14 +4677,108 @@ static void raw_materialize(int slot) {
     gPortPerfRawMaterialized++;
 }
 
+/* PORT (2026-11-01, TEMPORARY, draw log): a raw vertex's colour as the raw shader lights it (raw_materialize's
+ * formula, nothing changed) and as the N64 lights it (vtx_shade, the processed path), to compare in the log */
+static void dbg_raw_colors(int slot, unsigned out[6]) {
+    const Vtx* vtx = sLoadRaw[slot];
+    const int lit = sLoadLit[slot];
+    struct LoadedVertex tmp;
+    out[0] = out[1] = out[2] = out[3] = out[4] = out[5] = 0;
+    if (vtx == NULL || lit <= 0) return;
+    {
+        const RawLights* L = &sRawLights[lit - 1];
+        const signed char* n = vtx->n.n;
+        float c[3], nv[3] = { n[0], n[1], n[2] };
+        int k, i;
+        if (L->lit[1] != 0.0f && sLoadSlot[slot] < sGpuSlotN) {
+            const float(*r)[4] = (const float(*)[4])sGpuSlot[sLoadSlot[slot]].rows[2];
+            float sc = sqrtf(r[3][0] * r[3][0] + r[3][1] * r[3][1] + r[3][2] * r[3][2]);
+            float is = sc > 0.0f ? 1.0f / sc : 0.0f;
+            nv[0] = (r[1][0] * n[0] + r[1][1] * n[1] + r[1][2] * n[2]) * L->lit[2] * is;
+            nv[1] = (r[0][0] * n[0] + r[0][1] * n[1] + r[0][2] * n[2]) * L->lit[3] * is;
+            nv[2] = -(r[3][0] * n[0] + r[3][1] * n[1] + r[3][2] * n[2]) * is;
+        }
+        for (k = 0; k < 3; k++) c[k] = L->amb[k];
+        for (i = 0; i < 4; i++) {
+            float in = nv[0] * L->dir[i][0] + nv[1] * L->dir[i][1] + nv[2] * L->dir[i][2];
+            if (in > 0.0f) for (k = 0; k < 3; k++) c[k] += in * L->col[i][k];
+        }
+        for (k = 0; k < 3; k++) out[k] = c[k] >= 1.0f ? 255u : (unsigned)(c[k] * 255.0f + 0.5f);
+    }
+    if (rsp.geometry_mode & G_LIGHTING) {
+        vtx_shade(&vtx->v, &vtx->n, &tmp, 1.0f / 127.0f);
+        out[3] = tmp.color.r, out[4] = tmp.color.g, out[5] = tmp.color.b;
+    }
+}
+
 /* PORT PERF (2026-10-05): the raw path's common case - a triangle in a run of raw triangles under the same state -
  * without the general triangle path (target, culling, state and mode checks, palette insertion, the parameters):
  * all three vertices raw with the batch's light set, nothing changed since the last accepted triangle, and every
  * vertex new to the batch with its matrix already in the palette. Anything else (or a buffer about to fill) returns 0
  * and takes gfx_sp_tri1, which does the same work in full. */
+/* PORT (2026-11-01, TEMPORARY): Gameplay > Ground debug hides one group of the room's draws, to find which one
+ * makes the Deku Palace garden band (3ds_main.c). 0 off, 1 ground blend, 2 detail modulate, 3 decals, 4 translucent. */
+int gPortGDbg = 0;
+static int dbg_is_blend(void) { return sInRoomDl && (uint32_t)(rdp.combine_mode >> 32) == 0x00272c04; }
+/* TEMPORARY Ground debug, mode 24: hides the room mesh entry gPortGDbgN (1..80, stepped on the settings page). The smear
+ * goes away when the draw that paints it is the one hidden. */
+extern unsigned int gfx_port_frame_index;
+int gPortGDbgN = 1; /* the entry hidden by mode 24, stepped on the settings page */
+int PortGfx_DbgHideN(void) { return gPortGDbgN; }
+static int dbg_skip_group(void) {
+    uint32_t hi = (uint32_t)(rdp.combine_mode >> 32), oml = (uint32_t)rdp.other_mode_l;
+    if (gPortGDbg == 26) return !sInRoomDl; /* everything that is not room geometry */
+    if (!sInRoomDl) return 0;
+    if (gPortGDbg == 25) return 1; /* all room geometry */
+    switch (gPortGDbg) {
+        case 1: return hi == 0x00272c04;
+        case 2: return hi == 0x0020ac04;
+        case 3: return (oml & 0xC00) == 0xC00;
+        case 4: return !(oml & 0x20);
+    }
+    return 0;
+}
+
+/* PORT (2026-11-10): a raw triangle of a load whose box reaches past the guard band (sRawGuard, gfx_sp_vertex_gpu): 1 if
+ * its three vertices are in front of the eye and inside the guard band in every frame drawn from this logic frame (the
+ * 60 fps in-between cameras too), so it can go to the PICA raw; 0: it is drawn processed (gpu_emit_tri clips it) */
+static int raw_tri_in_guard(const uint8_t vidx[3]) {
+    const float gr = rsp.clip_ratio ? (float)rsp.clip_ratio : 2.0f;
+    int t, i;
+    for (i = 0; i < 3; i++) {
+        const uint16_t sl = sLoadSlot[vidx[i]];
+        if (sl == GPU_SLOT_IDENTITY || sGpuSlot == NULL || sl >= sGpuSlotN) {
+            return 0;
+        }
+        for (t = gPortReplayRec ? 0 : 2; t <= 2; t++) {
+            float y, nx, w, rw;
+            if (t == 2) { /* the logic frame: the cached numbers gpu_emit_tri's own guard test uses */
+                const float* zw = gpu_vtx_zw(vidx[i], sl);
+                w = zw[1], y = zw[2], nx = zw[3];
+            } else {
+                const struct LoadedVertex* lv = &rsp.loaded_vertices[vidx[i]];
+                const float(*r)[4] = (const float(*)[4])sGpuSlot[sl].rows[t];
+                y = r[0][0] * lv->x + r[0][1] * lv->y + r[0][2] * lv->z + r[0][3];
+                nx = r[1][0] * lv->x + r[1][1] * lv->y + r[1][2] * lv->z + r[1][3];
+                w = r[3][0] * lv->x + r[3][1] * lv->y + r[3][2] * lv->z + r[3][3];
+            }
+            rw = gr * w;
+            if (!(w > 0.0f) || y > rw || y < -rw || nx > rw || nx < -rw) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 static int raw_tri_fast(int a, int b, int c) {
+    if (dbg_skip_group()) return 0; /* the general path skips it */
+    if (DBG_CPUM && dbg_is_blend()) return 0; /* TEMPORARY test: the general (CPU) path */
     const int v[3] = { a, b, c };
     int i, ix[3];
+    if (sDrawTxt != NULL) {
+        return 0; /* (the draw log counts triangles in gfx_sp_tri1_impl) */
+    }
     if (!sTriStateOk || !sRawDraw || sRawParamBatch != sBatchId || a >= MAX_VERTICES || b >= MAX_VERTICES ||
         c >= MAX_VERTICES || sLoadRaw[a] == NULL || sLoadRaw[b] == NULL || sLoadRaw[c] == NULL ||
         sLoadLit[a] != sRawLitCur || sLoadLit[b] != sRawLitCur || sLoadLit[c] != sRawLitCur ||
@@ -3467,6 +4789,9 @@ static int raw_tri_fast(int a, int b, int c) {
         gfx_port_tri_count++;
         { extern u32 gPortPerfTrisIn; gPortPerfTrisIn++; gPortPerfRoomTris += sInRoomDl != 0; }
         return 1; /* entirely outside one clip plane: as gfx_sp_tri1_impl */
+    }
+    if (sRawGuard[a] | sRawGuard[b] | sRawGuard[c]) {
+        return 0; /* (the general path checks it against the guard band: gpu_emit_tri) */
     }
     for (i = 0; i < 3; i++) {
         int slot = v[i];
@@ -3490,6 +4815,7 @@ static int raw_tri_fast(int a, int b, int c) {
     gfx_port_tri_count++;
     { extern u32 gPortPerfTrisIn; gPortPerfTrisIn++; gPortPerfRoomTris += sInRoomDl != 0; }
     if (!gfx_citro3d_idx_push(ix[0], ix[1], ix[2])) {
+        drop_note(2);
         return 1; /* index buffer full: dropped, as the general path does */
     }
     gPortPerfRawTris++;
@@ -3508,10 +4834,16 @@ static void gpu_emit_tri(const uint8_t vidx[3]) {
         int r0 = vidx[0] < MAX_VERTICES && sLoadRaw[vidx[0]] != NULL;
         int r1 = vidx[1] < MAX_VERTICES && sLoadRaw[vidx[1]] != NULL;
         int r2 = vidx[2] < MAX_VERTICES && sLoadRaw[vidx[2]] != NULL;
-        if (r0 && r1 && r2 && sLoadLit[vidx[0]] == sLoadLit[vidx[1]] && sLoadLit[vidx[0]] == sLoadLit[vidx[2]]) {
+        const int dbgOffRaw = DBG_CPUM && dbg_is_blend(); /* TEMPORARY tests */
+        if (!dbgOffRaw && r0 && r1 && r2 && sLoadLit[vidx[0]] == sLoadLit[vidx[1]] && sLoadLit[vidx[0]] == sLoadLit[vidx[2]] &&
+            (!(sRawGuard[vidx[0]] | sRawGuard[vidx[1]] | sRawGuard[vidx[2]]) || raw_tri_in_guard(vidx))) {
+            if (sDrawTxt != NULL) fprintf(sDrawTxt, "R raw guard=%d\n", sRawGuard[vidx[0]] | sRawGuard[vidx[1]] | sRawGuard[vidx[2]]); /* (TEMPORARY) */
             gpu_emit_tri_raw(vidx);
             return;
         }
+        if (sDrawTxt != NULL && r0 && r1 && r2) fprintf(sDrawTxt, "R raw->proc\n"); /* (TEMPORARY draw log) */
+        /* (a raw triangle past the guard band, PORT 2026-11-10: its vertices are processed here and the guard test below
+         * sends it to the CPU clipper) */
         if (r0) raw_materialize(vidx[0]);
         if (r1) raw_materialize(vidx[1]);
         if (r2) raw_materialize(vidx[2]);
@@ -3543,9 +4875,12 @@ static void gpu_emit_tri(const uint8_t vidx[3]) {
         hi = c[1] > hi ? c[1] : hi;
         lo = c[1] < lo ? c[1] : lo;
         int cpu = !gPortRawRelax && (lo <= 0.0f || a[0] < -a[1] || b[0] < -b[1] || c[0] < -c[1]); /* (speed rules: the GPU clips) */
+        if (DBG_CPUM && dbg_is_blend()) cpu = 1; /* TEMPORARY test */
         { extern u32 gPortGpuRoute[4]; gPortGpuRoute[0]++; if (lo <= 0.0f) gPortGpuRoute[1]++; else if (cpu) gPortGpuRoute[2]++; }
-        if (!cpu && sGpuLin > 0) {
-            /* screen-linear mode: the RSP clips triangles that leave the guard band (x, y beyond +-ratio * w)
+        if (!cpu) {
+            /* (PORT: also for two-texture draws, where sGpuLin is 0 - ground/water blends with vertices far outside
+             * the screen overflowed the PICA raster range and flickered with camera motion)
+             * the RSP clips triangles that leave the guard band (x, y beyond +-ratio * w)
              * and interpolates the new edge vertices in clip space - the CPU clipper does exactly that */
             float r = rsp.clip_ratio ? (float)rsp.clip_ratio : 2.0f;
             const float* q[3] = { a, b, c };
@@ -3572,6 +4907,11 @@ static void gpu_emit_tri(const uint8_t vidx[3]) {
             }
         }
     gpu_no_split:
+        if (sDrawTxt != NULL) { /* (TEMPORARY draw log) the route, the clip x y w of the three vertices as computed here */
+            fprintf(sDrawTxt, "R %s lo=%.2f sl=%u,%u,%u | %.1f %.1f %.2f | %.1f %.1f %.2f | %.1f %.1f %.2f\n", cpu ? "cpu" : "gpu",
+                    (double)lo, (unsigned)sl[0], (unsigned)sl[1], (unsigned)sl[2], (double)-a[3], (double)a[2], (double)a[1],
+                    (double)-b[3], (double)b[2], (double)b[1], (double)-c[3], (double)c[2], (double)c[1]);
+        }
         if (cpu) {
             { extern u32 gPortGpuRoute[4]; gPortGpuRoute[3]++; }
             PROF_SET(PROF_SPLIT);
@@ -3610,6 +4950,7 @@ static void gpu_emit_tri(const uint8_t vidx[3]) {
             continue;
         }
         if (sGpuVbo == NULL || (u32)*sGpuVboPos >= sGpuVboCap) {
+            drop_note(0);
             return; /* this frame's vertex buffer is full */
         }
         ix[i] = (*sGpuVboPos)++;
@@ -3663,6 +5004,7 @@ static void gpu_emit_tri(const uint8_t vidx[3]) {
         }
     }
     if (!gfx_citro3d_idx_push(ix[0], ix[1], ix[2])) {
+        drop_note(2);
         return;
     }
     buf_vbo_len = buf_vbo_len ? buf_vbo_len : 1;
@@ -3675,6 +5017,7 @@ static void gpu_emit_tri(const uint8_t vidx[3]) {
 static void gfx_sp_tri1_impl(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx);
 static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
     uint64_t t0 = PERF_T(), f0 = gPortPerfFlush;
+    if (dbg_skip_group()) return;
     PROF_SET(PROF_TRI);
     gfx_sp_tri1_impl(vtx1_idx, vtx2_idx, vtx3_idx);
     PROF_SET(PROF_DL);
@@ -3779,17 +5122,83 @@ static void gfx_sp_tri1_impl(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_id
         gfx_rapi->set_zmode_decal(zmode_decal);
         rendering_state.decal_mode = zmode_decal;
     }
+#ifdef __3DS__
+    { /* PORT (2026-10-30): ZMODE_XLU decides depth ties the other way (gfx_citro3d.c updateDepth) */
+        extern void gfx_citro3d_set_zmode_xlu(bool xlu);
+        static int sZXlu = -1;
+        int zxlu = (rdp.other_mode_l & ZMODE_DEC) == ZMODE_XLU;
+        if (zxlu != sZXlu) {
+            gfx_flush();
+            gfx_citro3d_set_zmode_xlu(zxlu);
+            sZXlu = zxlu;
+        }
+    }
+    { /* PORT (2026-10-28): linear depth for perspective projections (gfx_citro3d.c updateDepth) */
+        extern void gfx_citro3d_set_depth_linear(float nearDist);
+        static float sLinN = -1.0f;
+        const float(*P)[4] = rsp.P_matrix;
+        float n = 0.0f;
+        if (gPortDepthLinear) {
+            /* PORT (2026-11-01): the game's projection is VIEW x perspective (see lights_refresh): w = -z of the view,
+             * so P[3][3] is the view's translation, not 0, and the old test (P[3][3] == 0) never held in the game: the
+             * W-buffer was off everywhere (draw log: lin=0, z-buffer branch, on all draws). Recover the perspective's
+             * P22 and P32 from the columns: z = P22 * zv + P32 and w = -zv give column 2 = -P22 * column 3 (rows 0-2),
+             * and P[3][2] = -P22 * P[3][3] + P32. */
+            float c3[3] = { P[0][3], P[1][3], P[2][3] };
+            float sw = c3[0] * c3[0] + c3[1] * c3[1] + c3[2] * c3[2];
+            int bi = fabsf(c3[0]) > fabsf(c3[1]) ? 0 : 1;
+            bi = fabsf(c3[2]) > fabsf(c3[bi]) ? 2 : bi;
+            if (sw > 0.81f && sw < 1.21f && fabsf(c3[bi]) > 0.3f) {
+                float p22 = -P[bi][2] / c3[bi];
+                float p32 = P[3][2] + p22 * P[3][3];
+                int ok = p32 < -1e-6f && p22 < -0.5f && p22 > -1.5f;
+                for (int q = 0; q < 3 && ok; q++) {
+                    ok = fabsf(P[q][2] + p22 * c3[q]) < 1e-3f;
+                }
+                if (ok) {
+                    n = -0.5f * p32;
+                    gPortDepthP[0] = p22, gPortDepthP[1] = p32, gPortDepthP[2] = -1.0f; /* (zbuffer_port.c) */
+                }
+            }
+        }
+        sDbgLinN = n;
+        if (n != sLinN) {
+            gfx_flush();
+            gfx_citro3d_set_depth_linear(n);
+            sLinN = n;
+        }
+    }
+#endif
     
     if (rdp.viewport_or_scissor_changed) {
-        if (memcmp(&rdp.viewport, &rendering_state.viewport, sizeof(rdp.viewport)) != 0) {
-            gfx_flush();
-            gfx_rapi->set_viewport(rdp.viewport.x, rdp.viewport.y, rdp.viewport.width, rdp.viewport.height);
-            rendering_state.viewport = rdp.viewport;
+        /* widescreen HUD anchoring (gfx_hud_shift_px): decided here, when the viewport goes to the GPU, so the draw
+         * target and widescreen state are this draw's */
+        struct XYWidthHeight vp = rdp.viewport; /* (HUD anchoring: in clip space, hud_shift_mp, and rectangles) */
+        if (hud_vp_small()) {
+            vp.x += gfx_hud_shift_px(); /* a small viewport moves whole (gfx_citro3d.c keeps it on the screen) */
+            hud_scale_box(&vp); /* the HUD size setting (the A button) */
         }
-        if (memcmp(&rdp.scissor, &rendering_state.scissor, sizeof(rdp.scissor)) != 0) {
+        if (memcmp(&vp, &rendering_state.viewport, sizeof(vp)) != 0) {
             gfx_flush();
-            gfx_rapi->set_scissor(rdp.scissor.x, rdp.scissor.y, rdp.scissor.width, rdp.scissor.height);
-            rendering_state.scissor = rdp.scissor;
+            gfx_rapi->set_viewport(vp.x, vp.y, vp.width, vp.height);
+            rendering_state.viewport = vp;
+        }
+        {
+            /* the anchored HUD's partial scissors move with it: the A button's own 45-pixel scissor stayed in place
+             * while the button moved right with the B/C buttons, and cut it down to a sliver (user report) */
+            __typeof__(rdp.scissor) sc = rdp.scissor;
+            float hs = gfx_hud_shift_px();
+            if (hs != 0.0f && sc.width < gfx_current_dimensions.width - 1) {
+                sc.x += hs;
+            }
+            if (sc.width < gfx_current_dimensions.width - 1) {
+                hud_scale_box(&sc);
+            }
+            if (memcmp(&sc, &rendering_state.scissor, sizeof(sc)) != 0) {
+                gfx_flush();
+                gfx_rapi->set_scissor(sc.x, sc.y, sc.width, sc.height);
+                rendering_state.scissor = sc;
+            }
         }
         rdp.viewport_or_scissor_changed = false;
     }
@@ -3804,7 +5213,33 @@ static void gfx_sp_tri1_impl(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_id
      * Opaque draws keep blending AND alpha test off, so their alpha is irrelevant (the key makes it 1). */
     bool blend = (((rdp.other_mode_l & (3U << 20)) == (G_BL_CLR_MEM << 20)) && ((rdp.other_mode_l & (3U << 16)) == (G_BL_1MA << 16))) ||
                  (((rdp.other_mode_l & (3U << 22)) == (G_BL_CLR_MEM << 22)) && ((rdp.other_mode_l & (3U << 18)) == (G_BL_1MA << 18)));
+#ifdef __3DS__
+    /* PORT (2026-10-30): additive blender modes, P * A + MEM * 1 (gfx_citro3d.c applyBlend) - the cycle that writes
+     * memory: the second in 2-cycle mode (the first is usually fog) */
+    int blend_add = 0;
+    {
+        uint32_t ol = rdp.other_mode_l;
+        int sh = two_cycle ? 0 : 2; /* cycle 1 fields: P 28, A 24, M 20, B 16; cycle 0: 30, 26, 22, 18 */
+        uint32_t P = (ol >> (28 + sh)) & 3, A = (ol >> (24 + sh)) & 3, M = (ol >> (20 + sh)) & 3,
+                 B = (ol >> (16 + sh)) & 3;
+        if (!blend && P == G_BL_CLR_IN && M == G_BL_CLR_MEM && B == G_BL_1 && A != G_BL_0) {
+            blend_add = A == G_BL_A_FOG ? 2 : 1;
+            blend = true;
+        }
+    }
+    {
+        extern void gfx_citro3d_set_blend_add(int mode, int constA);
+        static int sAddLast = 0, sAddALast = 0;
+        int addA = blend_add == 2 ? rdp.fog_color.a : 0;
+        if (blend_add != sAddLast || addA != sAddALast) {
+            gfx_flush();
+            gfx_citro3d_set_blend_add(blend_add, addA);
+            sAddLast = blend_add, sAddALast = addA;
+        }
+    }
+#endif
     bool use_fog = (rdp.other_mode_l >> 30) == G_BL_CLR_FOG;
+    if ((gPortGDbg == 19 || gPortGDbg == 23) && dbg_is_blend()) use_fog = false; /* TEMPORARY Ground debug test */
     bool texture_edge = (rdp.other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
     bool alpha_threshold = (rdp.other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
     bool use_alpha = blend || texture_edge;
@@ -3888,23 +5323,31 @@ static void gfx_sp_tri1_impl(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_id
     const struct TileDesc* utile[2];
     float tex_width[2] = { 1.0f, 1.0f }, tex_height[2] = { 1.0f, 1.0f };
     bool linear_filter = (rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+    if (gPortGDbg == 13 && dbg_is_blend()) linear_filter = false; /* TEMPORARY test: nearest */
     for (int i = 0; i < 2; i++) {
         int ti = (i == 1 && rdp.first_tile >= 2) ? rdp.first_tile : (rdp.first_tile + i) & 7;
+        int dbgForce = 0;
+        if ((gPortGDbg == 11 || gPortGDbg == 12) && dbg_is_blend()) { /* TEMPORARY test: both units sample ONE tile */
+            ti = gPortGDbg == 11 ? (rdp.first_tile & 7) : ((rdp.first_tile + 1) & 7);
+            dbgForce = 1;
+        }
         utile[i] = &rdp.tiles[ti];
         if (used_textures[i]) {
-            if (rdp.textures_changed[i]) {
+            if (rdp.textures_changed[i] || dbgForce) {
                 gfx_flush();
                 import_texture(i, ti);
                 rdp.textures_changed[i] = false;
             }
             const struct TileDesc* t = utile[i];
             struct TextureHashmapNode* node = rendering_state.textures[i];
-            if (linear_filter != node->linear_filter || t->cms != node->cms || t->cmt != node->cmt) {
+            uint8_t ecms = t->cms, ecmt = t->cmt;
+            if (gPortGDbg == 7 && i == 0 && dbg_is_blend()) ecms = ecmt = 0; /* TEMPORARY test: mirror -> repeat */
+            if (linear_filter != node->linear_filter || ecms != node->cms || ecmt != node->cmt) {
                 gfx_flush();
-                gfx_rapi->set_sampler_parameters(i, linear_filter, t->cms, t->cmt);
+                gfx_rapi->set_sampler_parameters(i, linear_filter, ecms, ecmt);
                 node->linear_filter = linear_filter;
-                node->cms = t->cms;
-                node->cmt = t->cmt;
+                node->cms = ecms;
+                node->cmt = ecmt;
             }
             if (node->width != 0 && node->height != 0) {
                 tex_width[i] = node->width;
@@ -3921,6 +5364,9 @@ static void gfx_sp_tri1_impl(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_id
     port_draw_snapshot(); /* first triangle of a batch: record the state it's drawn with */
 #endif
     
+    if ((gPortGDbg == 11 || gPortGDbg == 12) && dbg_is_blend()) {
+        rdp.textures_changed[0] = rdp.textures_changed[1] = true; /* the next draw re-imports its own textures */
+    }
     sTC.inv_tex_w[0] = 1.0f / tex_width[0];
     sTC.inv_tex_w[1] = 1.0f / tex_width[1];
     sTC.inv_tex_h[0] = 1.0f / tex_height[0];
@@ -3932,10 +5378,13 @@ static void gfx_sp_tri1_impl(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_id
     for (int t = 0; t < 2; t++) { /* libultraship's per-tile coordinate transform, as one multiply-add */
         const struct TileDesc* tl = utile[t];
         float su = 1.0f / 32.0f, sv = 1.0f / 32.0f;
-        if (tl->shifts != 0) {
+        if (gPortGDbg == 5 && t == 1 && dbg_is_blend()) {
+            /* TEMPORARY test: tile 1's x4 magnification off */
+        } else if (tl->shifts != 0) {
             su = tl->shifts <= 10 ? su / (1 << tl->shifts) : su * (1 << (16 - tl->shifts));
         }
-        if (tl->shiftt != 0) {
+        if (gPortGDbg == 5 && t == 1 && dbg_is_blend()) {
+        } else if (tl->shiftt != 0) {
             sv = tl->shiftt <= 10 ? sv / (1 << tl->shiftt) : sv * (1 << (16 - tl->shiftt));
         }
         sTC.u_scale[t] = su;
@@ -3948,12 +5397,132 @@ static void gfx_sp_tri1_impl(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_id
     sPVState++; /* packed vertices depend on sTC */
 #ifdef __3DS__
     sBatchId++;
+    if (sInRoomDl) {
+        /* each draw-state change in room geometry is one layer more (gfx_citro3d.c updateDepth: later wins ties) */
+        extern void gfx_citro3d_set_depth_room(int room);
+        gfx_flush();
+        if (sRoomSorted) {
+            sRoomSortedLayer += sRoomSortedLayer < 48;
+            gfx_citro3d_set_depth_room(sRoomSortedLayer);
+        } else {
+            sRoomEntryN++;
+            gfx_citro3d_set_depth_room(sRoomEntryN | ((gPortGDbg == 14 && dbg_is_blend()) ? 0x10000 : 0) |
+                                       ((gPortGDbg == 15 && dbg_is_blend()) ? 0x20000 : 0)); /* (flags: TEMPORARY test) */
+        }
+    }
+    if (sDrawTxt != NULL) {
+        int t;
+        drawlog_end_batch();
+        fprintf(sDrawTxt, "B%u room=%d oml=%08x omh=%08x cc=%08x%08x gm=%08x ft=%d lod=%u plod=%u", (unsigned)sBatchId,
+                sInRoomDl, (unsigned)rdp.other_mode_l, (unsigned)rdp.other_mode_h, (unsigned)(rdp.combine_mode >> 32),
+                (unsigned)rdp.combine_mode, (unsigned)rsp.geometry_mode, rdp.first_tile, (unsigned)consts.lod_frac,
+                (unsigned)rdp.prim_lod_frac);
+        for (t = 0; t < 2; t++) {
+            const struct TileDesc* tl = utile[t];
+            fprintf(sDrawTxt, " | u%d %s tex=%08x fmt=%d/%d tmem=%u cm=%u/%u mask=%u/%u shift=%u/%u ul=%u/%u lr=%u/%u line=%u",
+                    t, used_textures[t] ? "on" : "off",
+                    used_textures[t] && rendering_state.textures[t] ? (unsigned)(uintptr_t)rendering_state.textures[t]->texture_addr : 0u,
+                    tl->fmt, tl->siz, tl->tmem, tl->cms, tl->cmt, tl->masks, tl->maskt, tl->shifts, tl->shiftt, tl->uls,
+                    tl->ult, tl->lrs, tl->lrt, (unsigned)tl->line_size_bytes);
+        }
+        {
+            extern void gfx_citro3d_depth_info(char* buf, int n);
+            char db[160];
+            gfx_citro3d_depth_info(db, sizeof(db));
+            fprintf(sDrawTxt, " | %s | gp n=%.4f P23=%.6f P33=%.6f P32=%.4f P22=%.4f", db, (double)sDbgLinN,
+                    (double)rsp.P_matrix[2][3], (double)rsp.P_matrix[3][3], (double)rsp.P_matrix[3][2],
+                    (double)rsp.P_matrix[2][2]);
+        }
+        fprintf(sDrawTxt, "\n");
+    }
 #endif
     /* LOD fraction is derived from each triangle's w: keep re-evaluating state for those draws */
     sTriStateOk = !(usage & (1u << (8 + CCS_LODF)));
 
 emit_vertices:;
     const uint8_t vidx[3] = { vtx1_idx, vtx2_idx, vtx3_idx };
+#ifdef __3DS__
+    if (gPortGDbg == 24) { /* TEMPORARY: the same numbers the draw log's "U" line prints (3 x s, t) */
+        uint32_t h = 17u;
+        for (int q = 0; q < 3; q++) {
+            const int i = vidx[q];
+            int a, b;
+            if (i < MAX_VERTICES + 4 && sLoadRaw[i] != NULL) {
+                a = (int)sLoadRaw[i]->v.tc[0], b = (int)sLoadRaw[i]->v.tc[1];
+            } else {
+                a = (int)rsp.loaded_vertices[i].u, b = (int)rsp.loaded_vertices[i].v;
+            }
+            h = h * 31u + (uint32_t)(a & 0xFFFF);
+            h = h * 31u + (uint32_t)(b & 0xFFFF);
+        }
+        sDbgTriHash = h * 2654435761u;
+    }
+#endif
+#ifdef __3DS__
+    if (sDrawTxt != NULL) {
+        const uint8_t* idx = vidx;
+        int k;
+        float tx[3], ty[3], tw[3]; /* the triangle's clip-space vertices (x, y, w) */
+        for (k = 0; k < 3; k++) {
+            const int i = idx[k];
+            const struct LoadedVertex* lv = &rsp.loaded_vertices[i];
+            float x, y, w;
+            if (gPortGpuVtx && i < MAX_VERTICES && sGpuSlot != NULL && sLoadSlot[i] < sGpuSlotN) {
+                const float* zw = gpu_vtx_zw(i, sLoadSlot[i]);
+                w = zw[1], x = -zw[3], y = zw[2];
+            } else {
+                w = lv->w, x = lv->x, y = lv->y;
+            }
+            tx[k] = x, ty[k] = y, tw[k] = w;
+            if (w > 0.5f) {
+                float sx = 160.0f + x / w * 160.0f, sy = 120.0f - y / w * 120.0f;
+                if (sDrawTxtTris == 0 && k == 0) {
+                    sDrawTxtBox[0] = sDrawTxtBox[1] = sx, sDrawTxtBox[2] = sDrawTxtBox[3] = sy;
+                    sDrawTxtBox[4] = sDrawTxtBox[5] = w;
+                }
+                if (sx < sDrawTxtBox[0]) sDrawTxtBox[0] = sx;
+                if (sx > sDrawTxtBox[1]) sDrawTxtBox[1] = sx;
+                if (sy < sDrawTxtBox[2]) sDrawTxtBox[2] = sy;
+                if (sy > sDrawTxtBox[3]) sDrawTxtBox[3] = sy;
+                if (w < sDrawTxtBox[4]) sDrawTxtBox[4] = w;
+                if (w > sDrawTxtBox[5]) sDrawTxtBox[5] = w;
+            }
+        }
+        sDrawTxtTris++;
+        /* PORT (2026-11-01): every triangle, as "T x0 y0 w0 x1 y1 w1 x2 y2 w2" (clip space: screen = 160 + x / w * 160,
+         * 120 - y / w * 120; w = the distance). Where two draws overlap on screen, their w there says which is
+         * nearer and by how much - what decides ties in depth (the Deku Palace garden's layers, the lily pads and
+         * the water). In the file, in draw order. */
+        if (sDrawTxtTrisLogged < 40000) {
+            sDrawTxtTrisLogged++;
+            fprintf(sDrawTxt, "T %.1f %.1f %.2f %.1f %.1f %.2f %.1f %.1f %.2f\n", tx[0], ty[0], tw[0], tx[1], ty[1], tw[1],
+                    tx[2], ty[2], tw[2]);
+            /* PORT (2026-11-01): the triangle's source texture coordinates (N64 s, t as stored in the display list) and
+             * vertex colors / normals: "U s0 t0 r0 g0 b0 a0  s1 t1 ..." (the garden ground's smeared bands, blend draw).
+             * Raw-loaded vertices keep only their position on the loaded vertex; their data is in the source Vtx. */
+            if (sDrawLogFrame == 0) { /* (not in the multi-frame capture: size) */
+                int q;
+                fprintf(sDrawTxt, "U");
+                for (q = 0; q < 3; q++) {
+                    const int i = idx[q];
+                    if (i < MAX_VERTICES + 4 && sLoadRaw[i] != NULL) {
+                        const Vtx_t* sv = &sLoadRaw[i]->v;
+                        unsigned lc[6];
+                        dbg_raw_colors(i, lc);
+                        fprintf(sDrawTxt, " %d %d %u %u %u %u gpu %u %u %u n64 %u %u %u ", (int)sv->tc[0], (int)sv->tc[1],
+                                (unsigned)sv->cn[0], (unsigned)sv->cn[1], (unsigned)sv->cn[2], (unsigned)sv->cn[3], lc[0],
+                                lc[1], lc[2], lc[3], lc[4], lc[5]);
+                    } else {
+                        const struct LoadedVertex* lv = &rsp.loaded_vertices[i];
+                        fprintf(sDrawTxt, " %.0f %.0f %u %u %u %u ", lv->u, lv->v, (unsigned)lv->color.r,
+                                (unsigned)lv->color.g, (unsigned)lv->color.b, (unsigned)lv->color.a);
+                    }
+                }
+                fprintf(sDrawTxt, "\n");
+            }
+        }
+    }
+#endif
 #ifdef PORT_ICONGEN
     if (mesh_capturing()) {
         sMeshDbgTri++;
@@ -3970,7 +5539,7 @@ emit_vertices:;
             if (m->tex < 4096 && sMeshTex[m->tex].rgba == NULL) { /* decoded again now: the tile's state is this draw's */
                 int ti = rdp.first_tile & 7;
                 sMeshRedecode = 1;
-                import_texture_impl(0, ti);
+                import_texture(0, ti);
                 sMeshRedecode = 0;
             }
             m->flags = (sTC.used_textures[0] ? 1 : 0) |
@@ -4075,9 +5644,15 @@ static void gfx_calc_and_set_viewport(const Vp_t *viewport) {
     float height = 2.0f * viewport->vscale[1] / 4.0f;
     float x = (viewport->vtrans[0] / 4.0f) - width / 2.0f;
     float y = SCREEN_HEIGHT - ((viewport->vtrans[1] / 4.0f) + height / 2.0f);
+    if (gfx_cimg_is_hires()) { /* Bomber's Notebook: 576x454 -> 320x240 */
+        const float sx = (float)SCREEN_WIDTH / PORT_HIRES_W, sy = (float)SCREEN_HEIGHT / PORT_HIRES_H;
+        y = PORT_HIRES_H - ((viewport->vtrans[1] / 4.0f) + height / 2.0f);
+        x *= sx, width *= sx, y *= sy, height *= sy;
+    }
     rsp.half_px_x = width > 0.0f ? 1.0f / width : 0.0f;
     sGpuSlotCur = -1;
     rsp.half_px_y = height > 0.0f ? 1.0f / height : 0.0f;
+    sMPDirty = true; /* (the HUD's clip-space shift depends on the viewport's width) */
     rdp.vp_raw[0] = x;
     rdp.vp_raw[1] = y;
     rdp.vp_raw[2] = width;
@@ -4088,6 +5663,12 @@ static void gfx_calc_and_set_viewport(const Vp_t *viewport) {
 /* rdp.viewport from the raw N64 viewport, for the current target's dimensions */
 static void gfx_apply_viewport(void) {
     float x = rdp.vp_raw[0], y = rdp.vp_raw[1], width = rdp.vp_raw[2], height = rdp.vp_raw[3];
+    if (sScreenScale < 1.0f && sDrawTarget == NULL) { /* the end-of-day shrink, toward the screen's centre */
+        x = SCREEN_WIDTH / 2.0f + (x - SCREEN_WIDTH / 2.0f) * sScreenScale;
+        y = SCREEN_HEIGHT / 2.0f + (y - SCREEN_HEIGHT / 2.0f) * sScreenScale;
+        width *= sScreenScale;
+        height *= sScreenScale;
+    }
     
     /* PORT (2026-09-25): N64 screen x maps to x * RATIO_Y + pillar (4:3 content centered in the wider
      * target), and gfx_sp_vertex squeezes clip x by the aspect ratio around the viewport's center, so
@@ -4126,6 +5707,7 @@ static void gfx_sp_movemem(uint8_t index, uint8_t offset, const void* data) {
             if (lightidx >= 0 && lightidx <= MAX_LIGHTS) {
                 // NOTE: reads out of bounds if it is an ambient light
                 memcpy(rsp.current_lights + lightidx, data, sizeof(Light_t));
+                memcpy(rsp.current_lights_raw[lightidx], data, 16); /* (point lights: gfx_point_light) */
             } else if (lightidx < 0) { /* G_MVO_LOOKATX / G_MVO_LOOKATY */
                 /* guLookAt/guLookAtHilite always write col = colc = (0,0,0) for X and (0,0x80,0) for Y.
                  * Anything else is not a LookAt: the N64 boot logo's gsSPLookAt(0x01002E50) points one
@@ -4135,14 +5717,21 @@ static void gfx_sp_movemem(uint8_t index, uint8_t offset, const void* data) {
                 const uint8_t* b = (const uint8_t*)data;
                 int y = offset / 24; /* 0 = X, 1 = Y */
                 uint8_t want = y ? 0x80 : 0x00;
-                /* native (built by game code: guLookAtHilite): col/colc at bytes 0-2 / 4-6, dir at 8-10,
-                 * 12-15 zero. Stored in a ROM segment the same bytes sit at k ^ 7 (all DMA'd data): col at
-                 * 7,6,5 / colc at 3,2,1, dir at 15,14,13, logical 12-15 at physical 11-8 (zero). */
-                if (b[0] == 0 && b[1] == want && b[2] == 0 && b[4] == 0 && b[5] == want && b[6] == 0 &&
-                    (b[12] | b[13] | b[14] | b[15]) == 0) {
+                /* native (built by game code: guLookAtHilite): col/colc at bytes 0-2 / 4-6, dir at 8-10.
+                 * Stored in a ROM segment the same bytes sit at k ^ 7 (all DMA'd data): col at 7,6,5 / colc at
+                 * 3,2,1, dir at 15,14,13.
+                 * PORT (2026-10-30): which of the two is decided by the Y entry (col = colc = 0, 0x80, 0 tells them
+                 * apart; X's zeros match both), which gSPLookAt places 16 bytes after X. Bytes 11-15 decided it before,
+                 * but guLookAtHilite never writes them: the LookAt is GRAPH_ALLOC'd, so they held whatever the graphics
+                 * pool had there, different in the two alternating pools. Every other frame the LookAt was
+                 * thrown away and the environment maps went back to the default one: the Mirror Shield (and rupees,
+                 * bottles, Koume's gem...) flickering between two looks (user reports, video at 60 fps). */
+                const uint8_t* yb = y ? b : b + 16;
+                int native = yb[0] == 0 && yb[1] == 0x80 && yb[2] == 0 && yb[4] == 0 && yb[5] == 0x80 && yb[6] == 0;
+                int rom = yb[7] == 0 && yb[6] == 0x80 && yb[5] == 0 && yb[3] == 0 && yb[2] == 0x80 && yb[1] == 0;
+                if (native && b[0] == 0 && b[1] == want && b[2] == 0 && b[4] == 0 && b[5] == want && b[6] == 0) {
                     memcpy(rsp.current_lookat + y, data, sizeof(Light_t));
-                } else if (b[7] == 0 && b[6] == want && b[5] == 0 && b[3] == 0 && b[2] == want && b[1] == 0 &&
-                           (b[8] | b[9] | b[10] | b[11]) == 0) {
+                } else if (rom && b[7] == 0 && b[6] == want && b[5] == 0 && b[3] == 0 && b[2] == want && b[1] == 0) {
                     uint8_t tmp[16];
                     for (int k = 0; k < 16; k++) tmp[k] = b[k ^ 7];
                     memcpy(rsp.current_lookat + y, tmp, sizeof(Light_t));
@@ -4157,6 +5746,7 @@ static void gfx_sp_movemem(uint8_t index, uint8_t offset, const void* data) {
         case G_MV_L2:
             // NOTE: reads out of bounds if it is an ambient light
             memcpy(rsp.current_lights + (index - G_MV_L0) / 2, data, sizeof(Light_t));
+            memcpy(rsp.current_lights_raw[(index - G_MV_L0) / 2], data, 16);
             break;
 #endif
     }
@@ -4166,6 +5756,12 @@ static void gfx_sp_moveword(uint8_t index, uint16_t offset, uint32_t data) {
     switch (index) {
         case G_MW_SEGMENT:
             gfx_port_segments[offset / 4] = data;
+#ifdef __3DS__
+            if (offset / 4 == 0x0D && sGrpDepth > 0 && sGrpDepth <= INTERP_DEPTH) {
+                uintptr_t v = data;
+                sGrpSkel[sGrpDepth - 1] = v >= 0x80000000u ? v & 0x1FFFFFFFu : v; /* (as seg_addr resolves it) */
+            }
+#endif
             break;
         case G_MW_NUMLIGHT:
 #ifdef F3DEX_GBI_2
@@ -4201,6 +5797,10 @@ static void gfx_sp_texture(uint16_t sc, uint16_t tc, uint8_t level, uint8_t tile
 }
 
 static void gfx_dp_set_scissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
+    if (gfx_cimg_is_hires()) { /* Bomber's Notebook: 576x454 -> 320x240 */
+        ulx = ulx * SCREEN_WIDTH / PORT_HIRES_W, lrx = lrx * SCREEN_WIDTH / PORT_HIRES_W;
+        uly = uly * SCREEN_HEIGHT / PORT_HIRES_H, lry = lry * SCREEN_HEIGHT / PORT_HIRES_H;
+    }
     rdp.scissor_raw[0] = ulx;
     rdp.scissor_raw[1] = uly;
     rdp.scissor_raw[2] = lrx;
@@ -4222,14 +5822,79 @@ static int sStereoRoomThisFrame; /* a pre-rendered skybox room (shops, houses: G
  * pre-rendered room, the new picture can take a frame or two to arrive; those frames went wide and the room's 3D
  * geometry flashed in the side bars (hardware v41: "the drawing of triangles when moving the camera"). */
 static int sPrerenderedRecent; /* logic frames to stay 4:3 */
+/* PORT (2026-10-28): the end-of-day screen shrink (Play_Draw, gSaveContext.screenScale). The N64 copies the finished
+ * frame and draws it back scaled down (VisFbuf); the port has no copy of its frame to draw, so the black fill ended up
+ * covering the picture (user report: the screen went black before dawn instead of shrinking). Instead the whole frame
+ * is drawn scaled toward the centre: viewports, scissors and rectangles (G_NOOP 0x3D5Cssss, ssss = scale x 1000, at
+ * the frame's start - z_play.c; reset every frame). */
 #define WIDE_ACTIVE() (gPortWidescreen && !sBgThisFrame && !sBgLastFrame && !sStereoRoomThisFrame && \
-                       sPrerenderedRecent == 0 && sDrawTarget == NULL)
+                       sPrerenderedRecent == 0 && sDrawTarget == NULL && !gfx_cimg_is_hires() && sScreenScale >= 1.0f)
+
+/* PORT (2026-10-26): widescreen HUD anchoring. In widescreen the 3D view fills the 400-pixel screen but the N64 HUD
+ * kept its 4:3 positions, bunched toward the middle. z_parameter.c (tools/port/gen_native_hud.py) tags its HUD groups
+ * with G_NOOP 0x3D5E41aa (port_minimap.h gPortHudAnchor): aa = 1 left edge (hearts, magic, rupees, keys), 2 right
+ * edge (B/C/A buttons, minimap), 0 none. While a group is open, its rectangles and viewports move by the pillar width
+ * toward that edge, so the HUD sits at the same distance from the screen's edge as on the N64. The clock, text and
+ * menus are not tagged and stay centered. settings hud_edges=0 turns it off. */
+int gPortHudEdges = 1;
+static int sHudAnchor; /* 0 none, 1 / 3 left, 2 / 4 right, 5 bottom middle (reset every logic frame) */
+static int sRectNoHudShift; /* the rectangle being drawn is a full-width fill: it does not move */
+static float gfx_hud_shift_px(void) {
+    if (sHudAnchor == 0 || sHudAnchor == 5 || sRectNoHudShift || !gPortHudEdges || !WIDE_ACTIVE()) {
+        return 0.0f;
+    }
+    return hud_left() ? -GFX_PILLAR_X : GFX_PILLAR_X;
+}
+/* PORT (2026-11-12): the HUD size setting (Gameplay row, ENH_HUD_SIZE): each anchored group is drawn larger or smaller
+ * toward its own corner (anchor 1 top left, 2 top right, 3 bottom left, 4 bottom right, 5 bottom middle: the clock),
+ * on the screen only */
+static float hud_scale(void) {
+    static const float kScale[7] = { 1.0f, 1.1f, 1.2f, 1.3f, 0.7f, 0.8f, 0.9f };
+    int s = gPortEnh[ENH_HUD_SIZE];
+    if (sHudAnchor == 0 || sRectNoHudShift || sDrawTarget != NULL || s <= 0 || s > 6) {
+        return 1.0f;
+    }
+    return kScale[s];
+}
+static int hud_left(void) {
+    return sHudAnchor == 1 || sHudAnchor == 3;
+}
+static int hud_top(void) {
+    return sHudAnchor == 1 || sHudAnchor == 2;
+}
+static float hud_side(void) { /* the pivot's x in the HUD's frame: -1 left, 0 middle, 1 right */
+    return sHudAnchor == 5 ? 0.0f : hud_left() ? -1.0f : 1.0f;
+}
+/* a viewport or scissor box of the group (pixels, y from the bottom), scaled toward the corner of the HUD's frame */
+static void hud_scale_box(struct XYWidthHeight* b) {
+    float k = hud_scale(), px, py, x, y;
+    if (k == 1.0f) {
+        return;
+    }
+    px = GFX_PILLAR_X + SCREEN_WIDTH * RATIO_Y * (hud_side() + 1.0f) * 0.5f + gfx_hud_shift_px();
+    py = hud_top() ? SCREEN_HEIGHT * RATIO_Y : 0.0f;
+    x = px + ((float)b->x - px) * k;
+    y = py + ((float)b->y - py) * k;
+    b->x = (uint16_t)(x < 0.0f ? 0.0f : x + 0.5f);
+    b->y = (uint16_t)(y < 0.0f ? 0.0f : y + 0.5f);
+    b->width = (uint16_t)((float)b->width * k + 0.5f);
+    b->height = (uint16_t)((float)b->height * k + 0.5f);
+}
+
 static int sRectFullWidth; /* gfx_dp_fill_rectangle -> gfx_draw_rectangle: stretch to the whole target */
+static int sRectClampTile = -1; /* a stretched wrapped band drawn with S clamped (gfx_dp_texture_rectangle) */
+static uint8_t sRectClampSaved;
 
 static void gfx_apply_scissor(void) {
     uint32_t ulx = rdp.scissor_raw[0], uly = rdp.scissor_raw[1], lrx = rdp.scissor_raw[2], lry = rdp.scissor_raw[3];
     /* PORT (2026-09-25): pixels map like the content (x * RATIO_Y + pillar), except that in widescreen
      * mode a full-width scissor keeps the whole target so the widened 3D view fills the sides */
+    if (sScreenScale < 1.0f && sDrawTarget == NULL) { /* the end-of-day shrink */
+        ulx = (uint32_t)(SCREEN_WIDTH * 2.0f + ((float)ulx - SCREEN_WIDTH * 2.0f) * sScreenScale);
+        lrx = (uint32_t)(SCREEN_WIDTH * 2.0f + ((float)lrx - SCREEN_WIDTH * 2.0f) * sScreenScale);
+        uly = (uint32_t)(SCREEN_HEIGHT * 2.0f + ((float)uly - SCREEN_HEIGHT * 2.0f) * sScreenScale);
+        lry = (uint32_t)(SCREEN_HEIGHT * 2.0f + ((float)lry - SCREEN_HEIGHT * 2.0f) * sScreenScale);
+    }
     float x = ulx / 4.0f * RATIO_Y + GFX_PILLAR_X;
     float y = (SCREEN_HEIGHT - lry / 4.0f) * RATIO_Y;
     float width = (lrx - ulx) / 4.0f * RATIO_Y;
@@ -4257,7 +5922,8 @@ static uint8_t sWideLoaded[2];      /* per TMEM slot: the last load came from th
  * (gfx_select_target), and during the pause the frame's earlier draw is Link's off-screen preview, so the first
  * strip was judged off-screen, stayed 320 wide and left black corners at the top (hardware v42) */
 #define WIDE_ACTIVE_CIMG() (gPortWidescreen && !sBgThisFrame && !sBgLastFrame && !sStereoRoomThisFrame && \
-                            sPrerenderedRecent == 0 && gfx_cimg_is_screen())
+                            sPrerenderedRecent == 0 && gfx_cimg_is_screen() && !gfx_cimg_is_hires() && \
+                            sScreenScale >= 1.0f)
 int gPortFrameWide;                 /* gfx_3ds.c: this frame's 3D filled the whole width (set at the frame's end) */
 #endif
 static void gfx_dp_set_texture_image(uint32_t format, uint32_t size, uint32_t width, const void* addr) {
@@ -4289,6 +5955,8 @@ static void gfx_dp_set_tile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_t t
     t->cmt = cmt;
     t->shifts = shifts;
     t->shiftt = shiftt;
+    t->masks = (uint8_t)masks;
+    t->maskt = (uint8_t)maskt;
     t->line_size_bytes = line * 8;
     t->tmem = tmem;
     rdp.textures_changed[0] = true;
@@ -4404,6 +6072,9 @@ static void gfx_dp_load_block(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t
     rdp.loaded_texture[slot].addr = rdp.texture_to_load.addr;
     rdp.loaded_texture[slot].line_size_bytes = rdp.loaded_texture[slot].size_bytes;
     rdp.loaded_texture[slot].full_image_line_size_bytes = rdp.loaded_texture[slot].size_bytes;
+    rdp.loaded_texture[slot].dxt = dxt;
+    rdp.loaded_texture[slot].word_off = 0;
+    rdp.loaded_texture[slot].seq = ++sTexLoadSeq;
     
     rdp.textures_changed[0] = true;
     rdp.textures_changed[1] = true;
@@ -4444,6 +6115,9 @@ static void gfx_dp_load_tile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t 
     rdp.loaded_texture[slot].size_bytes = tile_line * tile_height;
     rdp.loaded_texture[slot].line_size_bytes = tile_line;
     rdp.loaded_texture[slot].full_image_line_size_bytes = full_line;
+    rdp.loaded_texture[slot].dxt = 0xFFFFFFFFu;
+    rdp.loaded_texture[slot].word_off = 0;
+    rdp.loaded_texture[slot].seq = ++sTexLoadSeq;
     rdp.textures_changed[0] = true;
     rdp.textures_changed[1] = true;
 }
@@ -4505,14 +6179,37 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
     float ulyf = uly;
     float lrxf = lrx;
     float lryf = lry;
+    if (gfx_cimg_is_hires()) { /* Bomber's Notebook: 576x454 -> 320x240 */
+        const float sx = (float)SCREEN_WIDTH / PORT_HIRES_W, sy = (float)SCREEN_HEIGHT / PORT_HIRES_H;
+        ulxf *= sx, lrxf *= sx, ulyf *= sy, lryf *= sy;
+    }
     
     ulxf = ulxf / (4.0f * HALF_SCREEN_WIDTH) - 1.0f;
     ulyf = -(ulyf / (4.0f * HALF_SCREEN_HEIGHT)) + 1.0f;
     lrxf = lrxf / (4.0f * HALF_SCREEN_WIDTH) - 1.0f;
     lryf = -(lryf / (4.0f * HALF_SCREEN_HEIGHT)) + 1.0f;
     
+    if (sScreenScale < 1.0f && sDrawTarget == NULL) { /* the end-of-day shrink */
+        ulxf *= sScreenScale, lrxf *= sScreenScale, ulyf *= sScreenScale, lryf *= sScreenScale;
+    }
     ulxf = gfx_adjust_x_for_aspect_ratio(ulxf);
     lrxf = gfx_adjust_x_for_aspect_ratio(lrxf);
+    /* widescreen HUD anchoring moves the rectangle (gfx_hud_shift_px, in the full target's NDC); a full-width fill not */
+    sRectNoHudShift = sRectFullWidth;
+    {
+        float hs = gfx_hud_shift_px();
+        float k = hud_scale();
+        if (hs != 0.0f) {
+            ulxf += 2.0f * hs / (float)gfx_current_dimensions.width;
+            lrxf += 2.0f * hs / (float)gfx_current_dimensions.width;
+        }
+        if (k != 1.0f) { /* the HUD size setting: toward the group's corner of the HUD's frame (target NDC) */
+            float px = gfx_adjust_x_for_aspect_ratio(hud_side()) + 2.0f * hs / (float)gfx_current_dimensions.width;
+            float py = hud_top() ? 1.0f : -1.0f;
+            ulxf = px + (ulxf - px) * k, lrxf = px + (lrxf - px) * k;
+            ulyf = py + (ulyf - py) * k, lryf = py + (lryf - py) * k;
+        }
+    }
     if (sRectFullWidth) { /* widescreen: a full-width fill (fade, letterbox, flash) covers the whole screen */
         ulxf = -1.0f;
         lrxf = 1.0f;
@@ -4561,6 +6258,7 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
     rsp.geometry_mode = geometry_mode_saved;
     rdp.viewport = viewport_saved;
     rdp.viewport_or_scissor_changed = true;
+    sRectNoHudShift = 0;
     
     if (cycle_type == G_CYC_COPY) {
         rdp.other_mode_h = saved_other_mode_h;
@@ -4593,6 +6291,39 @@ static void gfx_dp_texture_rectangle_impl(int32_t ulx, int32_t uly, int32_t lrx,
         lrx += 40 << 2;
         rdp.textures_changed[0] = true;
         rdp.textures_changed[1] = true;
+    }
+#endif
+#ifdef __3DS__
+    /* PORT (2026-10-26): widescreen. A 1/2-cycle texture rectangle across the N64's whole width (the telescope / lens
+     * mask, the scene title card band) stopped 40 pixels short of each side of the 400-pixel screen; it is carried on
+     * to the screen's edges with its texture coordinates continued (fills already stretch: sRectFullWidth). */
+    if (!flip && (rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) != G_CYC_COPY && ulx <= 0 &&
+        lrx >= (SCREEN_WIDTH - 1) * 4 && WIDE_ACTIVE_CIMG()) {
+        if (rdp.tiles[tile & 7].cms & G_TX_CLAMP) {
+            /* clamped (the lens / telescope mask): continued - its edge texels fill the sides */
+            int32_t nuls = (((int32_t)uls << 7) - (int32_t)dsdx * (40 << 2)) >> 7;
+            if (nuls >= -32768 && nuls <= 32767) {
+                uls = (int16_t)nuls;
+                ulx -= 40 << 2;
+                lrx += 40 << 2;
+            }
+        } else {
+            /* wrapped (the scene title card's gradient band): continuing would wrap the band's far end in at each
+             * side (black bars); stretched over the whole width instead, like 2 Ship 2 Harkinian draws it */
+            int32_t w = lrx - ulx;
+            dsdx = (int16_t)(((int32_t)dsdx * w) / (w + (80 << 2)));
+            ulx -= 40 << 2;
+            lrx += 40 << 2;
+            /* PORT (2026-11-06): the band's S runs 0 .. ~63.7 of its 64 texels, and the last stretched texel (~6 pixels
+             * on the 400-pixel screen) was filtered half with texel 0 - the gradient's other end wrapped in: the band
+             * stopped short of the right edge (user report, photo vs 2 Ship 2 Harkinian). S is clamped while it is
+             * drawn: inside 0..64 the band is unchanged, and its ends filter with their own edge texels. */
+            sRectClampTile = tile & 7;
+            sRectClampSaved = rdp.tiles[sRectClampTile].cms;
+            rdp.tiles[sRectClampTile].cms |= G_TX_CLAMP;
+            rdp.textures_changed[0] = true;
+            rdp.textures_changed[1] = true;
+        }
     }
 #endif
     if ((rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
@@ -4653,6 +6384,14 @@ static void gfx_dp_texture_rectangle_impl(int32_t ulx, int32_t uly, int32_t lrx,
     gfx_draw_rectangle(ulx, uly, lrx, lry);
     rdp.combine_mode = saved_combine_mode;
     rdp.drawing_rect = false;
+#ifdef __3DS__
+    if (sRectClampTile >= 0) { /* the title card band's S clamp (above) ends with it */
+        rdp.tiles[sRectClampTile].cms = sRectClampSaved;
+        sRectClampTile = -1;
+        rdp.textures_changed[0] = true;
+        rdp.textures_changed[1] = true;
+    }
+#endif
     if (one_to_one) {
         rdp.other_mode_h = (rdp.other_mode_h & ~(3U << G_MDSFT_TEXTFILT)) | (saved_omh_filter & (3U << G_MDSFT_TEXTFILT));
     }
@@ -4816,8 +6555,13 @@ static inline void *seg_addr(uintptr_t w1) {
  * found by tools/statediff fbdiff (Fire Temple torch glows as a screen-wide band). */
 static inline void *seg_addr_mtx(uintptr_t w1) {
 #ifdef __3DS__
-    if (w1 == 0x01000000u && gfx_port_segments[1] != 0) {
-        uintptr_t v = gfx_port_segments[1];
+    /* PORT (2026-10-26): MM's segment 1 holds TWO matrices (Play_Draw: play->billboardMtx[2]): 0x01000000 the
+     * spherical billboard, 0x01000040 the cylindrical one (rotation about y only), which rooms use for their wooden
+     * posts (South Clock Town's stalls and plaza pole: gsSPMatrix(0x01000040, G_MTX_MUL)). Only the first was
+     * translated; the second went through as a native pointer into the binary, and the posts were multiplied by
+     * whatever bytes lay there: dark spikes across the screen, or nowhere to be seen. */
+    if (w1 >= 0x01000000u && w1 < 0x01000080u && (w1 & 0x3Fu) == 0 && gfx_port_segments[1] != 0) {
+        uintptr_t v = gfx_port_segments[1] + (w1 & 0xFFu);
         return (void *) (v >= 0x80000000u ? v & 0x1FFFFFFFu : v);
     }
 #endif
@@ -4834,7 +6578,15 @@ static inline void *seg_addr_mtx(uintptr_t w1) {
  * importer's buffers (the whole 320x240 RGBA16 image is 150 KB). */
 static bool sUcodeS2dex = false;
 static void gfx_s2dex_bg_rect(const uObjBg* bg, bool copy) {
-    if (!sBgThisFrame) {
+#ifdef __3DS__
+    /* the paused frame's capture (MM restores it through gSPBgRectCopy): in widescreen its 400-pixel copy is drawn
+     * (gfx_dp_load_tile / the COPY-mode strip in gfx_dp_texture_rectangle_impl), so the frame stays wide */
+    extern const void* Port3ds_WideCapFor(const void* gameBuf);
+    int wideCap = copy && Port3ds_WideCapFor(seg_addr((uintptr_t)bg->b.imagePtr)) != NULL;
+#else
+    int wideCap = 0;
+#endif
+    if (!sBgThisFrame && !wideCap) {
         sBgThisFrame = 1; /* pre-rendered background: keep this frame 4:3 */
         gfx_flush();
         gfx_apply_scissor();
@@ -4879,6 +6631,7 @@ static void gfx_s2dex_bg_rect(const uObjBg* bg, bool copy) {
 }
 
 static uint32_t rdp_half1; /* G_RDPHALF_1 word for G_BRANCH_Z */
+int gPortHiDetail; /* 3ds_main.c settings: always the close-range level of detail */
 #ifdef __3DS__
 static uint32_t sDlBranches; /* display-list branches this frame (runaway guard, gfx_run_dl) */
 #endif
@@ -4931,8 +6684,11 @@ static void gfx_run_dl(Gfx* cmd) {
 #endif
 #endif
         if (opcode == (uint8_t)G_LOAD_UCODE) { /* track which microcode the DL runs under */
-            extern uint64_t gspS2DEX2d_fifoTextStart[];
-            sUcodeS2dex = (seg_addr(cmd->words.w1) == (void*)gspS2DEX2d_fifoTextStart);
+            extern uint64_t gspS2DEX2d_fifoTextStart[], gspS2DEX2_fifoTextStart[];
+            /* PORT (2026-10-26): MM's PreRender_CopyImage (the pause menu's background, restored every paused frame)
+             * loads gspS2DEX2_fifo, not OoT's gspS2DEX2d_fifo: its gSPBgRectCopy was never drawn - a black pause */
+            void* uc = seg_addr(cmd->words.w1);
+            sUcodeS2dex = uc == (void*)gspS2DEX2d_fifoTextStart || uc == (void*)gspS2DEX2_fifoTextStart;
             ++cmd;
             continue;
         }
@@ -4979,9 +6735,26 @@ static void gfx_run_dl(Gfx* cmd) {
                     sActT0 = now;
                 }
 #endif
-                else if ((cmd->words.w1 & 0xFFFFFFFEu) == 0x3D5E5200u) {
-                    /* z_room.c: room geometry begins (0) / ends (1) */
+                else if ((cmd->words.w1 & 0xFFFFFFFCu) == 0x3D5E5200u) {
+                    /* z_room.c: room geometry begins (0) / ends (1); 2 / 3: an entry Room_DrawCullable sorted by distance
+                     * (no layering step: every one at the step's last place, 48) */
+                    int sorted = (cmd->words.w1 & 2) != 0;
                     sInRoomDl = (cmd->words.w1 & 1) == 0;
+                    {
+                        extern void gfx_citro3d_set_depth_room(int room);
+                        gfx_flush();
+                        if (sInRoomDl && !sorted) sRoomEntryN++;
+                        sRoomSorted = sInRoomDl && sorted;
+                        sRoomSortedLayer = 40;
+                        gfx_citro3d_set_depth_room(sInRoomDl ? (sorted ? sRoomSortedLayer : sRoomEntryN) : 0);
+#ifdef __3DS__
+                        if (sDrawTxt != NULL) { /* room mesh entry boundaries, in draw order */
+                            drawlog_end_batch();
+                            fprintf(sDrawTxt, "E %s %d sorted=%d dl=%08x\n", sInRoomDl ? "begin" : "end", sRoomEntryN, sorted,
+                                    sInRoomDl ? (unsigned)cmd[1].words.w1 : 0u);
+                        }
+#endif
+                    }
                     {
                         static u64 sRoomT0;
                         extern u64 gPortPerfRoomTicks;
@@ -4991,6 +6764,27 @@ static void gfx_run_dl(Gfx* cmd) {
                             gPortPerfRoomTicks += svcGetSystemTick() - sRoomT0;
                             sRoomT0 = 0;
                         }
+                    }
+                } else if ((cmd->words.w1 & 0xFFFF0000u) == 0x3D5C0000u) { /* the end-of-day shrink */
+                    float sc = (float)(cmd->words.w1 & 0xFFFF) / 1000.0f;
+                    if (sc > 1.0f) sc = 1.0f;
+                    if (sc != sScreenScale) {
+                        gfx_flush();
+                        sScreenScale = sc;
+                        gfx_apply_viewport();
+                        gfx_apply_scissor();
+                    }
+                } else if ((cmd->words.w1 & 0xFFFFFF00u) == 0x3D5E4100u) {
+                    /* widescreen HUD anchoring (gfx_hud_shift_px): draws so far keep their viewport */
+                    int anchor = (int)(cmd->words.w1 & 0xFF);
+                    if (anchor > 5) anchor = 0; /* (1 / 3 left, 2 / 4 right; 3 / 4 bottom corners; 5 the clock) */
+                    if (anchor != sHudAnchor) {
+                        gfx_flush();
+                        sHudAnchor = anchor;
+                        sMPDirty = true;   /* the clip-space shift (hud_shift_mp) changes */
+                        sGpuSlotCur = -1;  /* GPU-path vertices take new rows */
+                        rdp.viewport_or_scissor_changed = true;
+                        sTriStateOk = false; /* (G_NOOP keeps the cached triangle state: the viewport must be re-sent) */
                     }
                 } else if ((cmd->words.w1 & 0xFFFFFF00u) == 0x3D5E3D00u) {
                     extern void gfx_citro3d_set_stereo_mode(int mode);
@@ -5010,10 +6804,14 @@ static void gfx_run_dl(Gfx* cmd) {
             {
                 uint64_t tm = PERF_T();
                 PROF_SET(PROF_MTX);
+                sInterpMtxW1 = cmd->words.w1;
+                sInterpMtxAddr = (uintptr_t)seg_addr_mtx(cmd->words.w1);
                 gfx_sp_matrix(C0(0, 8) ^ G_MTX_PUSH, (const int32_t *) seg_addr_mtx(cmd->words.w1));
                 gPortPerfMtx += PERF_T() - tm;
             }
 #else
+                sInterpMtxW1 = cmd->words.w1;
+                sInterpMtxAddr = (uintptr_t)seg_addr_mtx(cmd->words.w1);
                 gfx_sp_matrix(C0(16, 8), (const int32_t *) seg_addr_mtx(cmd->words.w1));
 #endif
                 break;
@@ -5086,7 +6884,33 @@ static void gfx_run_dl(Gfx* cmd) {
                 break;
             case (uint8_t)G_BRANCH_Z: {
                 uint32_t vi = C0(0, 12) / 2;
-                if (vi < MAX_VERTICES && rsp.loaded_vertices[vi].z <= (float)(int32_t)cmd->words.w1) {
+                float bz = vi < MAX_VERTICES ? rsp.loaded_vertices[vi].z : 0.0f;
+                if (gPortGpuVtx && vi < MAX_VERTICES && sLoadSlot[vi] != GPU_SLOT_IDENTITY) {
+                    /* PORT (2026-11-09): ANY vertex of the GPU path, raw or processed, keeps its object-space position in
+                     * loaded_vertices (gfx_sp_vertex_gpu), so the test below compared the room's world z for the
+                     * processed loads as well. A load goes the processed way when it comes near the camera or runs deep
+                     * into the distance (gfx_sp_vertex_gpu's box test), so close-range room geometry behind
+                     * gsSPBranchLessZraw switched between drawn and skipped as the camera moved (with
+                     * Detail NORMAL; Detail MAX takes every branch and skips this test). The clip z of its load's matrix, as the CPU path has it. */
+                    bz = gpu_vtx_zw((int)vi, sLoadSlot[vi])[0];
+                } else if (vi < MAX_VERTICES && sLoadRaw[vi] != NULL) {
+                    /* PORT (2026-10-26): a vertex loaded on the raw path (transformed on the GPU) keeps its object-space
+                     * position, so this compared the room's world z, not the depth: Clock Town's close-range detail
+                     * (the stalls' wooden beams under the thatch, behind gsSPBranchLessZraw) came and went with the
+                     * position in the town instead of the distance. Its clip z, as the processed path computes it. */
+                    const Vtx_t* rv = &sLoadRaw[vi]->v;
+                    mp_update();
+                    bz = rv->ob[0] * rsp.MP_matrix[0][2] + rv->ob[1] * rsp.MP_matrix[1][2] + rv->ob[2] * rsp.MP_matrix[2][2] +
+                         rsp.MP_matrix[3][2];
+                }
+                /* gPortHiDetail (settings "Detail: MAX"): every branch taken, like 2 Ship 2 Harkinian's "disable scene
+                 * geometry distance check" (G_EX_ALWAYS_EXECUTE_BRANCH): close-range models at any distance */
+                if (sDrawTxt != NULL) { /* (TEMPORARY draw log) */
+                    fprintf(sDrawTxt, "Z branch vi=%u bz=%.1f zval=%d taken=%d to=%08x\n", (unsigned)vi, (double)bz,
+                            (int)(int32_t)cmd->words.w1, vi < MAX_VERTICES && (gPortHiDetail || bz <= (float)(int32_t)cmd->words.w1),
+                            (unsigned)rdp_half1);
+                }
+                if (vi < MAX_VERTICES && (gPortHiDetail || bz <= (float)(int32_t)cmd->words.w1)) {
 #ifdef __3DS__
                     if (++sDlBranches > 400000u) {
                         PortLogFastX("[GFX] RUNAWAY stop cmd", (unsigned)(uintptr_t)cmd);
@@ -5103,6 +6927,10 @@ static void gfx_run_dl(Gfx* cmd) {
                 uint8_t rej = 0xFF;
                 for (k = v0; k <= vn && k < MAX_VERTICES; k++) {
                     rej &= rsp.loaded_vertices[k].clip_rej;
+                }
+                if (sDrawTxt != NULL) { /* (TEMPORARY draw log) */
+                    fprintf(sDrawTxt, "C culldl %u..%u rej=%02x %s\n", (unsigned)v0, (unsigned)vn, (unsigned)rej,
+                            (v0 <= vn && vn < MAX_VERTICES && rej != 0) ? "CULLED" : "kept");
                 }
                 if (v0 <= vn && vn < MAX_VERTICES && rej != 0) {
                     return;
@@ -5124,6 +6952,10 @@ static void gfx_run_dl(Gfx* cmd) {
 #endif
             case (uint8_t)G_TRI1:
 #ifdef F3DEX_GBI_2
+                if (C0(16, 8) / 2 >= MAX_VERTICES || C0(8, 8) / 2 >= MAX_VERTICES || C0(0, 8) / 2 >= MAX_VERTICES) {
+                    gfx_bad_gbi("[gbi] G_TRI1 vertex index past 63, w0", cmd->words.w0, cmd->words.w1);
+                    break;
+                }
 #ifdef __3DS__
                 if (raw_tri_fast(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2)) {
                     break;
@@ -5145,6 +6977,11 @@ static void gfx_run_dl(Gfx* cmd) {
             case (uint8_t)G_QUAD:
 #endif
 #ifdef __3DS__
+                if (C0(16, 8) / 2 >= MAX_VERTICES || C0(8, 8) / 2 >= MAX_VERTICES || C0(0, 8) / 2 >= MAX_VERTICES ||
+                    C1(16, 8) / 2 >= MAX_VERTICES || C1(8, 8) / 2 >= MAX_VERTICES || C1(0, 8) / 2 >= MAX_VERTICES) {
+                    gfx_bad_gbi("[gbi] G_TRI2/G_QUAD vertex index past 63, w0", cmd->words.w0, cmd->words.w1);
+                    break;
+                }
                 if (!raw_tri_fast(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2)) {
                     gfx_sp_tri1(C0(16, 8) / 2, C0(8, 8) / 2, C0(0, 8) / 2);
                 }
@@ -5313,6 +7150,16 @@ void gfx_handle_events(void) {
 void gfx_start_frame(void) {
 #ifdef __3DS__
     gfx_texture_cache_apply_queued(); /* data the game loaded since the last frame (render thread) */
+    /* PORT (2026-10-30): the texture cache wraps BETWEEN frames. When its pool filled up in the middle of a frame the
+     * wrap handed the first textures' GPU slots to new textures while the frame's earlier draws (kept for the 60fps
+     * replay, and drawn after every import) still pointed at those slots: those draws showed another texture - smooth
+     * olive patches on the Deku Palace garden's ground, changing with every frame, and a few other spots (user photos).
+     * Invalidated entries (data the game reloads) also stay in the pool until a wrap, so it fills quickly. Wrapping at
+     * a frame's start while a frame's worth of room is left makes that mid-frame wrap rare. */
+    if (gfx_texture_cache.pool_pos > sizeof(gfx_texture_cache.pool) / sizeof(struct TextureHashmapNode) * 5 / 8) {
+        gfx_texture_cache.pool_pos = 0;
+        memset(gfx_texture_cache.hashmap, 0, sizeof(gfx_texture_cache.hashmap));
+    }
     gfx_citro3d_raw_mode(0); /* frames start on the GPU path's program */
     /* latched per frame: the A/B switch flips gPortRawVtxWant from the game thread (render thread) */
     gPortRawVtx = gPortRawVtxWant && gPortGpuVtx && gfx_citro3d_raw_ready();
@@ -5321,6 +7168,7 @@ void gfx_start_frame(void) {
     sRawLightsN = 0;
     sRawLightCache.index = 0;
     sInRoomDl = 0;
+    { extern void gfx_citro3d_set_depth_room(int room); gfx_citro3d_set_depth_room(0); sRoomEntryN = 0; sRoomSorted = 0; }
     sDlBranches = 0;
 #endif
     sTriStateOk = false;
@@ -5341,6 +7189,17 @@ void gfx_start_frame(void) {
     sPrerenderedRecent = (sBgThisFrame || sStereoRoomThisFrame) ? 20 : sPrerenderedRecent > 0 ? sPrerenderedRecent - 1 : 0;
     sBgLastFrame = sBgThisFrame; gPortPrerenderedFrame = sBgLastFrame || sStereoRoomThisFrame; sStereoRoomThisFrame = 0;
     sBgThisFrame = 0;
+    if (sScreenScale != 1.0f) {
+        sScreenScale = 1.0f; /* (z_play.c tags each frame that shrinks) */
+        gfx_apply_viewport();
+        gfx_apply_scissor();
+    }
+    if (sHudAnchor != 0) {
+        sMPDirty = true; /* (a matrix shifted for the HUD must not carry into the next frame) */
+        sGpuSlotCur = -1;
+    }
+    sHudAnchor = 0; /* HUD anchoring tags are per frame */
+    texdump_rt_frame();
     if (!gPortEventsExternal) {
         gfx_wapi->handle_events();
     }
@@ -5367,6 +7226,48 @@ static void gbi_audit_dump(unsigned frame) {
 }
 #endif
 int gPortInterpExtra; /* 1 while an in-between (interpolated) pass re-runs the display list */
+
+#ifdef __3DS__
+/* PORT (2026-11-12): the CRT filter (Gameplay row "CRT filter", ENH_CRT): every other line of the game's 240 is darkened,
+ * like a CRT's scanlines - a texture rectangle over the whole finished frame, drawn through the normal pipeline (in
+ * widescreen a full-width 1-cycle rectangle already stretches to the screen's edges: gfx_dp_texture_rectangle_impl).
+ * Not over a frame that draws a pre-rendered picture (the pause screen's background is a capture of a frame that
+ * already has the lines). */
+static const uint8_t sCrtTex[16 * 2] __attribute__((aligned(8))) = {
+    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+};
+static void gfx_crt_overlay(void) {
+    static Gfx sCrtDL[24];
+    Gfx* g = sCrtDL;
+    int level = gPortEnh[ENH_CRT];
+    if (level <= 0 || sBgThisFrame || !gfx_cimg_is_screen() || gfx_cimg_is_hires()) {
+        return;
+    }
+    if (sHudAnchor != 0) { /* (the lines cover the screen: no HUD anchoring or HUD size applies to them) */
+        gfx_flush();
+        sHudAnchor = 0;
+        sMPDirty = true;
+        rdp.viewport_or_scissor_changed = true;
+    }
+    gDPPipeSync(g++);
+    gDPSetCycleType(g++, G_CYC_1CYCLE);
+    gDPSetRenderMode(g++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
+    /* black, with the texture's intensity times the primitive alpha as its alpha */
+    gDPSetCombineLERP(g++, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0);
+    gDPSetPrimColor(g++, 0, 0, 0, 0, 0, level == 1 ? 72 : 128);
+    gDPSetTexturePersp(g++, G_TP_NONE);
+    gDPSetTextureFilter(g++, G_TF_POINT);
+    gDPSetTextureLUT(g++, G_TT_NONE);
+    gDPLoadTextureBlock(g++, sCrtTex, G_IM_FMT_I, G_IM_SIZ_8b, 16, 2, 0, G_TX_WRAP | G_TX_NOMIRROR,
+                        G_TX_WRAP | G_TX_NOMIRROR, 4, 1, G_TX_NOLOD, G_TX_NOLOD);
+    gDPSetScissor(g++, G_SC_NON_INTERLACE, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    gSPTextureRectangle(g++, 0, 0, SCREEN_WIDTH << 2, SCREEN_HEIGHT << 2, G_TX_RENDERTILE, 0, 0, 1 << 10, 1 << 10);
+    gDPPipeSync(g++);
+    gSPEndDisplayList(g++);
+    gfx_run_dl(sCrtDL);
+}
+#endif
 
 void gfx_run(Gfx *commands) {
     if (!gPortInterpExtra) gfx_port_frame_index++;
@@ -5397,6 +7298,22 @@ void gfx_run(Gfx *commands) {
     double t0 = gfx_wapi->get_time();
     gfx_rapi->start_frame();
 #ifdef __3DS__
+    { /* (TEMPORARY draw log, 2026-11-12) the previous logged frame as the hardware finished it: pixels per draw id (the "G"
+       * lines' id=) at the end of that frame, with their bounding box in the depth buffer (portrait, dims below) */
+        extern int Port3ds_IdStats(const u32** count, const u16 (**box)[4], int* w, int* h);
+        const u32* cnt;
+        const u16(*box)[4];
+        int w, h, i;
+        if (Port3ds_IdStats(&cnt, &box, &w, &h) && sDrawTxt != NULL) {
+            fprintf(sDrawTxt, "S previous frame: pixels per draw id, buffer %dx%d\n", w, h);
+            for (i = 0; i < 256; i++) {
+                if (cnt[i] != 0) {
+                    fprintf(sDrawTxt, "S id=%d px=%u box=%u,%u..%u,%u\n", i, (unsigned)cnt[i], (unsigned)box[i][0],
+                            (unsigned)box[i][1], (unsigned)box[i][2], (unsigned)box[i][3]);
+                }
+            }
+        }
+    }
     if (gPortReplayRec) {
         extern void gfx_citro3d_rec_begin(void);
         extern int gfx_citro3d_rec_direct(int k);
@@ -5416,6 +7333,9 @@ void gfx_run(Gfx *commands) {
 #endif
     PROF_SET(PROF_DL);
     gfx_run_dl(commands);
+#ifdef __3DS__
+    gfx_crt_overlay();
+#endif
     gfx_flush();
 #ifdef __3DS__
     {
@@ -5491,6 +7411,10 @@ void gfx_run(Gfx *commands) {
     gfx_wapi->swap_buffers_begin();
 #ifdef __3DS__
     port_draw_log_commit();
+    if (sDrawTxt != NULL) { /* (TEMPORARY draw log) this frame's draw ids are read back before the next one (gfx_3ds.c) */
+        extern void Port3ds_IdStatsRequest(void);
+        Port3ds_IdStatsRequest();
+    }
 #endif
 }
 

@@ -5,6 +5,7 @@
  */
 
 #include "z_en_fu.h"
+#include "port_minimap.h"
 #include "overlays/actors/ovl_En_Fu_Mato/z_en_fu_mato.h"
 #include "overlays/actors/ovl_En_Fu_Kago/z_en_fu_kago.h"
 #include "overlays/actors/ovl_Bg_Fu_Kaiten/z_bg_fu_kaiten.h"
@@ -799,6 +800,10 @@ void func_80962F4C(EnFu* this, PlayState* play) {
         Message_StartTextbox(play, 0x288B, &this->actor);
     }
 
+    /* PORT (2026-11-08): cheat, always win minigames (2S2H Minigames, at their easiest): Honey & Darling, one target is all of them */
+    if (PORT_CHEAT_ON(CHEAT_MINIGAMES) && (this->unk_548 >= 1)) {
+        this->unk_548 = this->unk_54C;
+    }
     if ((!DynaPolyActor_IsPlayerAbove((DynaPolyActor*)this->actor.child) &&
          (player->actor.bgCheckFlags & BGCHECKFLAG_GROUND)) ||
         (gSaveContext.timerCurTimes[TIMER_ID_MINIGAME_2] <= SECONDS_TO_TIMER(0)) || (this->unk_548 == this->unk_54C)) {

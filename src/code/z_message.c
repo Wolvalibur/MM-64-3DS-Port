@@ -1,4 +1,5 @@
 #include "z64message.h"
+#include "port_minimap.h"
 #include "global.h"
 
 #include "gfxalloc.h"
@@ -227,7 +228,8 @@ bool Message_ShouldAdvance(PlayState* play) {
             Audio_PlaySfx(NA_SE_SY_MESSAGE_PASS);
         }
         return CHECK_BTN_ALL(controller->press.button, BTN_A) || CHECK_BTN_ALL(controller->press.button, BTN_B) ||
-               CHECK_BTN_ALL(controller->press.button, BTN_CUP);
+               CHECK_BTN_ALL(controller->press.button, BTN_CUP) ||
+               (gPortFastText && CHECK_BTN_ALL(controller->cur.button, BTN_B)); /* PORT: 2S2H fast text */
     }
 }
 
@@ -240,7 +242,8 @@ bool Message_ShouldAdvanceSilent(PlayState* play) {
         return CHECK_BTN_ALL(controller->press.button, BTN_A);
     } else {
         return CHECK_BTN_ALL(controller->press.button, BTN_A) || CHECK_BTN_ALL(controller->press.button, BTN_B) ||
-               CHECK_BTN_ALL(controller->press.button, BTN_CUP);
+               CHECK_BTN_ALL(controller->press.button, BTN_CUP) ||
+               (gPortFastText && CHECK_BTN_ALL(controller->cur.button, BTN_B)); /* PORT: 2S2H fast text */
     }
 }
 
@@ -1623,13 +1626,16 @@ void Message_DrawTextDefault(PlayState* play, Gfx** gfxP) {
     }
 
     if (msgCtx->textDelayTimer == 0) {
-        msgCtx->textDrawPos = i + 1;
+        msgCtx->textDrawPos = i + (gPortFastText ? 10 : 1); /* PORT: 2S2H fast text */
         msgCtx->textDelayTimer = 0;
         if (msgCtx->msgMode == MSGMODE_9) {
             msgCtx->msgMode = MSGMODE_TEXT_DISPLAYING;
         }
     } else {
         msgCtx->textDelayTimer--;
+        if (gPortFastText) {
+            msgCtx->textDelayTimer = 0;
+        }
     }
     *gfxP = gfx;
 }
@@ -4474,6 +4480,8 @@ void Message_DrawMain(PlayState* play, Gfx** gfxP) {
                                (msgCtx->ocarinaStaff->state == OCARINA_SONG_INVERTED_TIME) ||
                                (msgCtx->ocarinaStaff->state == OCARINA_SONG_DOUBLE_TIME) ||
                                (msgCtx->ocarinaStaff->state == OCARINA_SONG_GORON_LULLABY_INTRO) ||
+                               /* PORT (2026-11-08): 2S2H Songs/EnableSunsSong (GAMEPLAY: Sun's Song) */
+                               (PORT_ENH(ENH_SUNS_SONG) && (msgCtx->ocarinaStaff->state == OCARINA_SONG_SUNS)) ||
                                CHECK_QUEST_ITEM(QUEST_SONG_SONATA + msgCtx->ocarinaStaff->state)) {
                         sLastPlayedSong = msgCtx->ocarinaStaff->state;
                         msgCtx->lastPlayedSong = msgCtx->ocarinaStaff->state;
@@ -4705,7 +4713,7 @@ void Message_DrawMain(PlayState* play, Gfx** gfxP) {
 
                     if (msgCtx->ocarinaAction == OCARINA_ACTION_FREE_PLAY_DONE) {
                         if (sLastPlayedSong == OCARINA_SONG_ELEGY) {
-                            if ((play->sceneId == SCENE_F40) || (play->sceneId == SCENE_F41) ||
+                            if (PORT_CHEAT_ON(CHEAT_ELEGY) || (play->sceneId == SCENE_F40) || (play->sceneId == SCENE_F41) ||
                                 (play->sceneId == SCENE_IKANAMAE) || (play->sceneId == SCENE_CASTLE) ||
                                 (play->sceneId == SCENE_IKNINSIDE) || (play->sceneId == SCENE_IKANA) ||
                                 (play->sceneId == SCENE_INISIE_N) || (play->sceneId == SCENE_INISIE_R) ||
@@ -5531,6 +5539,10 @@ void Message_Update(PlayState* play) {
                 if (CHECK_BTN_ALL(input->press.button, BTN_B) && !msgCtx->textUnskippable) {
                     msgCtx->textboxSkipped = true;
                     msgCtx->textDrawPos = msgCtx->decodedTextLen;
+                } else if (gPortFastText && CHECK_BTN_ALL(input->cur.button, BTN_B) && !msgCtx->textUnskippable &&
+                           !msgCtx->textboxSkipped) { /* PORT: 2S2H fast text - B held skips too */
+                    msgCtx->textboxSkipped = true;
+                    msgCtx->textDrawPos = msgCtx->decodedTextLen;
                 } else if (CHECK_BTN_ALL(input->press.button, BTN_A) && !msgCtx->textUnskippable) {
 
                     while (true) {
@@ -5907,7 +5919,9 @@ void Message_Update(PlayState* play) {
                     }
                 } else if (sLastPlayedSong == OCARINA_SONG_DOUBLE_TIME) {
                     if (interfaceCtx->restrictions.songOfDoubleTime == 0) {
-                        if ((CURRENT_DAY != 3) || (gSaveContext.save.isNight == 0)) {
+                        if (PortDoubleTime_Begin(play)) {
+                            /* PORT: choose the hour (2S2H BetterSongOfDoubleTime, ultra_shims.c) */
+                        } else if ((CURRENT_DAY != 3) || (gSaveContext.save.isNight == 0)) {
                             if (gSaveContext.save.isNight) {
                                 Message_StartTextbox(play, sDoubleTimeSkipToDayTextIds[CURRENT_DAY - 1], NULL);
                             } else {

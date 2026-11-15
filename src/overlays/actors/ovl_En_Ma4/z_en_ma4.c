@@ -5,6 +5,7 @@
  */
 
 #include "z_en_ma4.h"
+#include "port_minimap.h"
 
 #define FLAGS                                                                                  \
     (ACTOR_FLAG_ATTENTION_ENABLED | ACTOR_FLAG_FRIENDLY | ACTOR_FLAG_UPDATE_CULLING_DISABLED | \
@@ -751,6 +752,9 @@ void EnMa4_HorsebackGameWait(EnMa4* this, PlayState* play) {
         play->interfaceCtx.minigamePoints = 1;
     }
 
+    if (PORT_CHEAT_ON(CHEAT_MINIGAMES) && (this->poppedBalloonCounter >= 1)) { /* PORT (2026-11-08): cheat, always win minigames (2S2H Minigames, at their easiest): one balloon */
+        this->poppedBalloonCounter = 10;
+    }
     if ((gSaveContext.timerCurTimes[TIMER_ID_MINIGAME_2] >= SECONDS_TO_TIMER(120)) ||
         (this->poppedBalloonCounter == 10)) {
         gSaveContext.timerStates[TIMER_ID_MINIGAME_2] = TIMER_STATE_6;

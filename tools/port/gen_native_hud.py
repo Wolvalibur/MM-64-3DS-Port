@@ -17,21 +17,43 @@ def adapt(path):
     if path.name == "z_parameter.c":
         source = replace(source, "void Interface_Draw(PlayState* play) {",
                          "void Interface_Draw(PlayState* play) {\n    PortHud_Update(play);")
+        # widescreen HUD anchoring (port_minimap.h gPortHudAnchor): hearts, rupees, keys and magic to the left
+        # edge; the minimap and the B/C/A buttons to the right edge; nothing else.
         source = replace(source, "        LifeMeter_Draw(play);",
-                         "        Gfx* portHudStart = OVERLAY_DISP;\n        LifeMeter_Draw(play);")
-        source = replace(source, "        Magic_DrawMeter(play);", """        Magic_DrawMeter(play);
+                         "        Gfx* portHudStart = OVERLAY_DISP;\n"
+                         "        gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_LEFT);\n"
+                         "        LifeMeter_Draw(play);")
+        # (2026-11-12: each group also names its corner, which the HUD size setting scales toward: hearts and magic
+        # top left, rupees and keys bottom left, the minimap bottom right, the buttons top right)
+        source = replace(source, "        // Draw Rupee Icon",
+                         "        gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_LEFT_BOTTOM);\n"
+                         "        // Draw Rupee Icon")
+        source = replace(source, "        Magic_DrawMeter(play);", """        gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_LEFT);
+        Magic_DrawMeter(play);
         if (!gPortHudTop) {
             OVERLAY_DISP = portHudStart;
         }""")
+        source = replace(source, "        Map_DrawMinimap(play);",
+                         "        gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_RIGHT_BOTTOM);\n"
+                         "        Map_DrawMinimap(play);\n"
+                         "        gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_NONE);")
         source = replace(source, "        Interface_DrawItemButtons(play);",
+                         "        gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_RIGHT);\n"
                          "        portHudStart = OVERLAY_DISP;\n        Interface_DrawItemButtons(play);")
+        source = replace(source, "        Interface_DrawPauseMenuEquippingIcons(play);",
+                         "        gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_NONE);\n"
+                         "        Interface_DrawPauseMenuEquippingIcons(play);")
         source = replace(source, "        Interface_DrawAButton(play);", """        Interface_DrawAButton(play);
         if (!gPortHudTop) {
             OVERLAY_DISP = portHudStart;
         }""")
         source = replace(source, "                Interface_DrawClock(play);", """                portHudStart = OVERLAY_DISP;
+                gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_BOTTOM); /* (2026-11-14: the HUD size setting scales it) */
                 Interface_DrawClock(play);
-                if (!gPortHudTop) {
+                gPortHudAnchor(OVERLAY_DISP++, PORT_HUD_NONE);
+                /* (with the top HUD off the clock still shows while the Song of Double Time's hour is chosen on it:
+                 * PortDoubleTime_Active, ultra_shims.c) */
+                if (!gPortHudTop && !PortDoubleTime_Active()) {
                     OVERLAY_DISP = portHudStart;
                 }""")
     elif path.name == "z_kaleido_setup.c":

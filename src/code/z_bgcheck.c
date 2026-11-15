@@ -5,6 +5,7 @@
 #include "line_numbers.h"
 
 #include "global.h"
+#include "port_minimap.h" /* PORT: cheats */
 #include "fault.h"
 #include "vt.h"
 #include "z64actor.h"
@@ -4200,6 +4201,11 @@ WallType SurfaceType_GetWallType(CollisionContext* colCtx, CollisionPoly* poly, 
 }
 
 s32 SurfaceType_GetWallFlags(CollisionContext* colCtx, CollisionPoly* poly, s32 bgId) {
+#ifdef __3DS__
+    if (gPortCheats[CHEAT_CLIMB]) { /* PORT: cheat, every wall climbable (2S2H ClimbAnywhere) */
+        return sWallFlags[SurfaceType_GetWallType(colCtx, poly, bgId)] | WALL_FLAG_3;
+    }
+#endif
     return sWallFlags[SurfaceType_GetWallType(colCtx, poly, bgId)];
 }
 
@@ -4271,6 +4277,11 @@ u32 SurfaceType_GetEcho(CollisionContext* colCtx, CollisionPoly* poly, s32 bgId)
 }
 
 u32 SurfaceType_IsHookshotSurface(CollisionContext* colCtx, CollisionPoly* poly, s32 bgId) {
+#ifdef __3DS__
+    if (gPortCheats[CHEAT_HOOKSHOT]) { /* PORT: cheat (2S2H HookshotAnywhere) */
+        return true;
+    }
+#endif
     return SurfaceType_GetData(colCtx, poly, bgId, 1) >> 17 & 1;
 }
 

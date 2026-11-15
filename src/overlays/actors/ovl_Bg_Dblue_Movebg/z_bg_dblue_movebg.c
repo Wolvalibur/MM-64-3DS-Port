@@ -5,6 +5,7 @@
  */
 
 #include "z_bg_dblue_movebg.h"
+#include "port_minimap.h"
 #include "assets/objects/object_dblue_object/object_dblue_object.h"
 #include "overlays/actors/ovl_Obj_Hunsui/z_obj_hunsui.h"
 
@@ -400,7 +401,8 @@ void func_80A2A444(BgDblueMovebg* this, PlayState* play) {
     s16 temp_v0;
 
     this->unk_188++;
-    this->unk_188 = CLAMP_MAX(this->unk_188, 5);
+    /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
+    this->unk_188 = PORT_ENH(ENH_FAST_PUSH) ? 20 : CLAMP_MAX(this->unk_188, 5);
 
     sp20 = Math_StepToS(&this->unk_18A, 900, this->unk_188);
     temp_v0 = this->unk_18A * this->unk_17E;
@@ -488,7 +490,8 @@ void func_80A2A7F8(BgDblueMovebg* this, PlayState* play) {
     s32 temp;
 
     this->unk_188++;
-    this->unk_188 = CLAMP_MAX(this->unk_188, 5);
+    /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
+    this->unk_188 = PORT_ENH(ENH_FAST_PUSH) ? 20 : CLAMP_MAX(this->unk_188, 5);
 
     sp28 = Math_StepToS(&this->unk_18A, 900, this->unk_188);
     sp26 = this->unk_18A * this->unk_17E;

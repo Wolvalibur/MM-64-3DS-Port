@@ -5,6 +5,7 @@
  */
 
 #include "z_obj_iceblock.h"
+#include "port_minimap.h"
 #include "assets/objects/object_ice_block/object_ice_block.h"
 
 #define FLAGS (ACTOR_FLAG_UPDATE_CULLING_DISABLED)
@@ -1138,7 +1139,7 @@ void func_80A25D28(ObjIceblock* this, PlayState* play) {
     sp34 = true;
     if (sp30 == -1) {
         sp34 = false;
-    } else if (!(this->unk_1B0 & 2) && (this->unk_26E[sp30] >= 11)) {
+    } else if (!(this->unk_1B0 & 2) && (PORT_ENH(ENH_FAST_PUSH) || (this->unk_26E[sp30] >= 11))) { /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
         sp34 = true;
         if (!func_80A24118(this, play, (this->dyna.pushForce > 0.0f) ? 59.9f : 89.9f, &sp24)) {
             func_80A232C4(this, sp30);
@@ -1172,7 +1173,8 @@ void func_80A25E50(ObjIceblock* this, PlayState* play) {
         func_80A23B88(this);
         func_80A2541C(this, play);
         func_80A25BA0(this);
-    } else if (sp38) {
+    } else if (sp38 || (PORT_ENH(ENH_FAST_PUSH) && Math_StepToF(this->unk_264, this->unk_268, CLAMP_MAX(temp_f2, 3.5f)))) {
+        /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
         if (func_80A24118(this, play, 59.9f, &sp28)) {
             Actor_PlaySfx(&this->dyna.actor, NA_SE_EV_BLOCK_BOUND);
         }

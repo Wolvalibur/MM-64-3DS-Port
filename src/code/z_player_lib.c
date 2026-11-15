@@ -5,6 +5,7 @@
 
 #include "global.h"
 #include "z64draw.h"
+#include "port_interp.h"
 
 #include "assets/objects/gameplay_keep/gameplay_keep.h"
 
@@ -2204,10 +2205,19 @@ void Player_DrawHookshotReticle(PlayState* play, Player* player, f32 hookshotDis
             Matrix_Translate(pos.x, pos.y, pos.z, MTXMODE_NEW);
             Matrix_Scale(scale, scale, scale, MTXMODE_APPLY);
 
+#ifdef __3DS__
+            /* PORT (2026-11-15): 60 fps: the reticle had no interpolation tag, so it sat where this logic frame put it
+             * while the camera turned smoothly, and shook on the in-between frames (user report). Blended as seen from
+             * the camera, like the hookshot itself. */
+            gPortInterpPush(OVERLAY_DISP++, PORT_INTERP_ID_HOOK_RETICLE, PORT_INTERP_CAMREL);
+#endif
             MATRIX_FINALIZE_AND_LOAD(OVERLAY_DISP++, play->state.gfxCtx);
 
             gSPSegment(OVERLAY_DISP++, 0x06, play->objectCtx.slots[player->actor.objectSlot].segment);
             gSPDisplayList(OVERLAY_DISP++, gHookshotReticleDL);
+#ifdef __3DS__
+            gPortInterpPop(OVERLAY_DISP++);
+#endif
 
             CLOSE_DISPS(play->state.gfxCtx);
         }
@@ -2442,7 +2452,7 @@ s32 Player_OverrideLimbDrawGameplayCommon(PlayState* play, s32 limbIndex, Gfx** 
                     func_80125340();
                     func_80125318(pos, rot);
 
-                    if (bubble != NULL) {
+                    if ((bubble != NULL) && (bubble->actor.id == ACTOR_EN_ARROW)) { /* PORT: not the hookshot */
                         s32 requiredScopeTemp[2];
 
                         player->unk_AF0[0].x = 1.0f - (bubble->bubble.unk_144 * 0.03f);
@@ -2506,7 +2516,7 @@ s32 Player_OverrideLimbDrawGameplayCommon(PlayState* play, s32 limbIndex, Gfx** 
 
             rotX = player->upperLimbRot.x;
             if ((player->transformation == PLAYER_FORM_DEKU) && (player->stateFlags3 & PLAYER_STATE3_40)) {
-                if (player->heldActor != NULL) {
+                if ((player->heldActor != NULL) && (player->heldActor->id == ACTOR_EN_ARROW)) { /* PORT: as above */
                     rotX += TRUNCF_BINANG(((EnArrow*)(player->heldActor))->bubble.unk_144 * -470.0f);
                 }
             }

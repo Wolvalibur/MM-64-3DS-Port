@@ -142,6 +142,12 @@ static bool gfx_citro3d_z_is_from_0_to_1(void)
 static bool sDepthTestOn = false;
 static bool sDepthUpdateOn = true;
 static bool sDepthDecal = false;
+static bool sDepthXlu = false; /* ZMODE_XLU (gfx_pc.c): the RDP passes it only when strictly nearer */
+static int sDepthRoom = 0; /* drawing room geometry (z_room.c tags, gfx_pc.c sInRoomDl): 0 no, else the 1-based mesh entry */
+/* PORT (2026-10-28): linear depth (W-buffer) for perspective draws: 0 = the z/w buffer, else the projection's near
+ * distance as -P[3][2] / 2 (gfx_pc.c sets it per draw). See updateDepth. */
+static float sDepthLinN = 0.0f;
+#define DEPTH_W_MAX 32768.0f /* linear depth = w / DEPTH_W_MAX (farther than any MM far plane) */
 
 static bool sUseBlend;
 
@@ -714,6 +720,7 @@ static void performTexSwizzle(const u8* src, u32* dst, u32 w, u32 h)
     }
 }
 
+int gPortTexPadClamp; /* gfx_pc.c: 1 = S clamped, 2 = T clamped (the texture being uploaded) */
 static void gfx_citro3d_upload_texture(uint8_t *rgba32_buf, int width, int height) {
     gPortC3dCalls[5]++;
     if(width < 8 || height < 8 || (width & (width - 1)) || (height & (height - 1)))
@@ -735,13 +742,19 @@ static void gfx_citro3d_upload_texture(uint8_t *rgba32_buf, int width, int heigh
                     int x2 = i % 8;
                     int y2 = i / 8;
 
+                    /* PORT (2026-10-26): padding texels. Was "subtract the size once": for a texture under half
+                     * the padded size (64x1 scene title card gradient, 1-3 texel strips) rows/columns past the
+                     * second copy read past the image - stale buffer bytes, the streaked purple title banner. A
+                     * wrapped axis repeats the texture; a clamped one repeats its edge, so sampling past the
+                     * image (UVs are scaled to it, the GPU clamps at the padded edge) and bilinear filtering at
+                     * its border see the edge texel, not the other side (seams in the pause pages' pieces). */
                     int realX = x + x2;
                     if(realX >= width)
-                        realX -= width;
+                        realX = (gPortTexPadClamp & 1) ? width - 1 : realX % width;
 
                     int realY = y + y2;
                     if(realY >= height)
-                        realY -= height;
+                        realY = (gPortTexPadClamp & 2) ? height - 1 : realY % height;
 
                     int pos = sTileOrder[x2 % 4 + y2 % 4 * 4] + 16 * (x2 / 4) + 32 * (y2 / 4);
                     u32 c = ((u32*)rgba32_buf)[realY * width + realX];
@@ -824,10 +837,116 @@ static void gfx_citro3d_set_sampler_parameters(int tile, bool linear_filter, uin
     sTexBoundOk[tile] = true;
 }
 
+/* PORT (2026-11-01): what the last updateDepth sent to the GPU (the draw log, gfx_pc.c) */
+static float sDbgScale, sDbgOff;
+static int sDbgBranch; /* 1 = W-buffer, 0 = z-buffer */
+void gfx_citro3d_depth_info(char* buf, int n)
+{
+    snprintf(buf, n, "dep lin=%.2f br=%d t=%d u=%d dec=%d xlu=%d room=%d sc=%.9g off=%.9g", sDepthLinN, sDbgBranch,
+             (int)sDepthTestOn, (int)sDepthUpdateOn, (int)sDepthDecal, (int)sDepthXlu, sDepthRoom, sDbgScale, sDbgOff);
+}
+
 static void updateDepth()
 {
-    C3D_DepthTest(sDepthTestOn, GPU_LEQUAL, sDepthUpdateOn ? GPU_WRITE_ALL : GPU_WRITE_COLOR);
-    C3D_DepthMap(true, sDepthDecal ? -1 : -1, sDepthDecal ? -0.001f : 0);
+    C3D_DepthTest(sDepthTestOn, (sDepthRoom & 0x10000) ? GPU_ALWAYS : GPU_LEQUAL, sDepthUpdateOn ? GPU_WRITE_ALL : GPU_WRITE_COLOR); /* (0x10000: TEMPORARY Ground debug test) */
+    /* PORT (2026-10-28): translucent surfaces (depth tested, not writing depth) drawn over the same geometry as an
+     * opaque one get a small pull toward the camera. On the N64 the two compute identical depths; here they can go
+     * through different vertex paths (CPU / GPU shaders) and differ in the last bits, so the overlay z-fought with what
+     * it covers - a flickering moire on the water and ground outside the Deku Palace at some camera angles (user
+     * report, video). Decals keep their larger offset. */
+    if (sDepthLinN > 0.0f) {
+        /* PORT (2026-10-28): the W-buffer. With z/w the PICA's 24-bit floats (16-bit mantissa) lose the depth of
+         * distant surfaces: two surfaces a few units apart several hundred units away compare at random, and the
+         * overlay over the ground outside the Deku Palace (and anything layered like it) flickered at some camera
+         * angles, whatever small bias they got (user reports, three times). A W-buffer stores the distance itself:
+         * about 0.03 units of error at any distance. Hardware depth = scale * zout + offset * w, zout = -(z + w) / 2
+         * (gfx_pc.c), and zout + w = n (f - w) / (f - n): the near distance n up close, fading to 0 at the far plane, so
+         *   depth = o (1 - e) w - (o d / n)(zout + w)  =  w / W_MAX  pulled toward the camera by up to d units + a share e of w
+         * Decals and translucent overlays keep a pull, as before, now in units that mean the same at any distance. */
+        const float o = 1.0f / DEPTH_W_MAX;
+        float d = 0.0f, e = 0.0f, k;
+        /* PORT (2026-10-30): the RDP lets an opaque surface win a tie against a translucent one (ZMODE_XLU passes only
+         * when strictly nearer). The lily pads (opaque) sit exactly at the water's height, and the water (translucent,
+         * not writing depth) drawn after them pulled toward the camera won the tie at random: pads flickering between
+         * above and under the water (user reports). Translucent surfaces that only TEST depth are now pushed back a hair
+         * instead; opaque and depth-writing surfaces keep their true depth (the z-buffer the game reads back for glows
+         * and the sun is unchanged, a previous attempt that moved written depths let torch glows show through walls).
+         * Decals keep their pull. */
+        if (sDepthDecal) {
+            /* PORT (2026-10-31): was 0.5 units + w / 4096 (0.6 at 500 units): a decal water surface drawn over the lily
+             * pads, which stand a hair above it, won against them from the steep top-down views (pads "underwater",
+             * user report, twice) but not from the ground. Just above the W-buffer's error (~0.03 + w / 131072). */
+            d = 0.08f, e = 1.0f / 65536.0f;
+        } else if (sDepthTestOn && !sDepthUpdateOn) {
+            d = -0.1f, e = -1.0f / 32768.0f;
+        }
+        if ((sDepthRoom & 0xFFFF) && sDepthTestOn) {
+            /* PORT (2026-10-31): the room's own geometry sits a hair farther back (0.3 units + w / 1024, 0.7 units at
+             * 400 away), so what is drawn over it after it - actors - wins a near tie, as on the N64, where a later
+             * surface passes up to its slope tolerance behind what is there and that tolerance grows with distance
+             * and slant. The Deku Palace garden's ground is the room's ground plus ObjPurify's hill model
+             * (object_dekucity_obj) in the same place: tied at random, the room's streaky texture (0x01d53a40 in the
+             * texture dump) showed through in bands that came and went (user video, dump). Same for anything else
+             * resting on room surfaces (shadows, lily pads). */
+            d -= 0.3f, e -= 1.0f / 1024.0f;
+            if (sDepthUpdateOn && !sDepthDecal) {
+                /* PORT (2026-11-01): layers of the room drawn on top of each other in the same plane (the Deku Palace
+                 * garden: the ground, then the beds, then the grass) tie in depth; the N64 gives the tie to the one drawn
+                 * later (RDP: an opaque surface passes at equal depth), so the layering never changes. Here the winner
+                 * was whichever the rounding favoured, a pattern that changed with the slightest camera movement: the
+                 * ground's texture showing through the beds in smooth, streaky bands that came and went (user video,
+                 * draw log: one 300-triangle ground draw and ~15 overlapping layer draws). Each mesh entry (z_room.c
+                 * order, and each state change inside an entry) now sits a hair nearer than the one before: 0.08 units,
+                 * above the W-buffer's own error (~0.03 + w / 131072), for up to 48 steps (3.8 units at most: the N64's
+                 * own depth step is 3 units at 1000 away). */
+                int n = (sDepthRoom & 0xFFFF) > 48 ? 48 : (sDepthRoom & 0xFFFF);
+                d += 0.08f * (float)(n - 48);
+                if (sDepthRoom & 0x20000) d += 6.0f; /* TEMPORARY Ground debug test: pulled 6 units nearer */
+            }
+            if (!sDepthDecal && !sDepthUpdateOn) {
+                /* PORT (2026-11-01): translucent room surfaces (the swamp water) lose a near tie against what is
+                 * already there by up to the N64's depth step, which grows with the SQUARE of the distance (~3e-6 w^2
+                 * units: 0.75 at 500 away, 3 at 1000; 15-bit z). The pad draw log (user, 11/01) shows the pads (opaque,
+                 * written) at w 580-1130 under the water (XLU, tested, w 700-1050): w / 1024 is 1 unit at 1000, a third
+                 * of what the N64 absorbs, so from the high views the water won over pads that rest in it, and not
+                 * from low ones. A linear stand-in for the square, right at the distances these views have. */
+                e -= 1.0f / 320.0f;
+            }
+        }
+        k = o * d / sDepthLinN;
+        sDbgBranch = 1, sDbgScale = -k, sDbgOff = o * (1.0f - e) - k;
+        C3D_DepthMap(false, -k, o * (1.0f - e) - k);
+        return;
+    }
+    sDbgBranch = 0, sDbgScale = -1.0f, sDbgOff = sDepthDecal ? -0.001f : (sDepthTestOn && !sDepthUpdateOn ? -0.00005f : 0);
+    C3D_DepthMap(true, -1, sDepthDecal ? -0.001f : (sDepthTestOn && !sDepthUpdateOn ? -0.00005f : 0));
+}
+
+static int depth_lin_bits(void) {
+    int b;
+    memcpy(&b, &sDepthLinN, sizeof(b));
+    return b;
+}
+
+void gfx_citro3d_set_zmode_xlu(bool xlu) {
+    if (xlu == sDepthXlu) return;
+    sDepthXlu = xlu;
+    if (sRec) recOp(OP_DECAL, sDepthDecal, depth_lin_bits(), sDepthXlu, sDepthRoom);
+    updateDepth();
+}
+
+void gfx_citro3d_set_depth_room(int room) {
+    if (room == sDepthRoom) return;
+    sDepthRoom = room;
+    if (sRec) recOp(OP_DECAL, sDepthDecal, depth_lin_bits(), sDepthXlu, sDepthRoom);
+    updateDepth();
+}
+
+void gfx_citro3d_set_depth_linear(float nearDist) {
+    if (nearDist == sDepthLinN) return;
+    sDepthLinN = nearDist;
+    if (sRec) recOp(OP_DECAL, sDepthDecal, depth_lin_bits(), sDepthXlu, sDepthRoom);
+    updateDepth();
 }
 
 static void gfx_citro3d_set_depth_test(bool depth_test) {
@@ -843,7 +962,7 @@ static void gfx_citro3d_set_depth_mask(bool z_upd) {
 }
 
 static void gfx_citro3d_set_zmode_decal(bool zmode_decal) {
-    if (sRec) recOp(OP_DECAL, zmode_decal, 0, 0, 0);
+    if (sRec) recOp(OP_DECAL, zmode_decal, depth_lin_bits(), sDepthXlu, sDepthRoom);
     sDepthDecal = zmode_decal;
     updateDepth();
 }
@@ -861,9 +980,16 @@ extern int Port3ds_IsOffscreen(void);
  * normal-mode target coordinates; kept in every mode so a switch into stereo starts with the right ones */
 static int sVp[4] = { 0, 0, 400, 240 }, sSc[4] = { 0, 0, 400, 240 };
 
+static void scissor_hw(void);
+static void setRemap(float a, float b);
+/* the current viewport's remap (non-stereo, applied at each draw): identity unless the viewport was clamped */
+static float sVpRemap[2] = { 1.0f, 0.0f };
+#define setRemapVp(a, b) (sVpRemap[0] = (a), sVpRemap[1] = (b))
+
 static void gfx_citro3d_set_viewport(int x, int y, int width, int height) {
     if (sRec) recOp(OP_VIEWPORT, x, y, width, height);
     if (Port3ds_IsOffscreen()) { /* 1x 320x240-space off-screen target (gfx_3ds.c) */
+        setRemapVp(1.0f, 0.0f);
         C3D_SetViewport(y, 320 - (x + width), height, width);
         return;
     }
@@ -871,12 +997,41 @@ static void gfx_citro3d_set_viewport(int x, int y, int width, int height) {
     x = TOP_W - (x + width);
     if (gGfx3DSMode == GFX_3DS_MODE_STEREO) {
         C3D_SetViewport(y, x, height, width);
-    } else if (gGfx3DSMode == GFX_3DS_MODE_AA_22 || gGfx3DSMode == GFX_3DS_MODE_WIDE_AA_12)
-        C3D_SetViewport(y * 2, x * 2, height * 2, width * 2);
+    } else {
+        /* PORT (2026-10-26): a viewport running off the screen's long axis (the widescreen HUD's left-edge anchoring
+         * moves the hearts/magic/rupees viewport 40 pixels past the target's end) is clamped to the target, and the
+         * shader's remap (out.y = y * a + w * b, as the stereo path's far viewports) puts the geometry where the
+         * unclamped viewport would have: the left HUD group stayed at its 4:3 place (user report) */
+        int fl = (gGfx3DSMode == GFX_3DS_MODE_NORMAL) ? 1 : 2;
+        int fs = (gGfx3DSMode == GFX_3DS_MODE_AA_22 || gGfx3DSMode == GFX_3DS_MODE_WIDE_AA_12) ? 2 : 1;
+        int d0 = x * fl, dw = width * fl, lim = TOP_W * fl;
+        int a0 = d0 < 0 ? 0 : d0, a1 = (d0 + dw > lim) ? lim : d0 + dw;
+        if (a1 > a0 && (a0 != d0 || a1 != d0 + dw)) {
+            int aw = a1 - a0;
+            C3D_SetViewport(y * fs, a0, height * fs, aw);
+            setRemapVp((float)dw / (float)aw, (float)(2 * (d0 - a0) + dw) / (float)aw - 1.0f);
+        } else {
+            C3D_SetViewport(y * fs, d0, height * fs, dw);
+            setRemapVp(1.0f, 0.0f);
+        }
+    }
+    /* PORT (2026-10-26): C3D_SetViewport turns the scissor OFF (citro3d base.c). gfx_pc.c only re-sends the scissor
+     * when the scissor itself changes, so after any viewport change (the A button's, a menu's, each frame's first)
+     * the 2D screen drew with no scissor: the 3D view's wide sides stayed visible in 4:3 mode (user report: "the
+     * aspect ratio doesn't change to 4:3"), and every N64 scissor (letterbox, split views) was lost. Stereo draws set
+     * the scissor per eye already (gfx_citro3d_draw). Off-screen targets keep their old behaviour. */
+    scissor_hw();
+}
+
+/* the last top-screen scissor (sSc) to the GPU, in the current mode's target coordinates */
+static void scissor_hw(void) {
+    int x = TOP_W - (sSc[0] + sSc[2]), y = sSc[1], width = sSc[2], height = sSc[3];
+    if (gGfx3DSMode == GFX_3DS_MODE_STEREO || gGfx3DSMode == GFX_3DS_MODE_NORMAL)
+        C3D_SetScissor(GPU_SCISSOR_NORMAL, y, x, y + height, x + width);
+    else if (gGfx3DSMode == GFX_3DS_MODE_AA_22 || gGfx3DSMode == GFX_3DS_MODE_WIDE_AA_12)
+        C3D_SetScissor(GPU_SCISSOR_NORMAL, y * 2, x * 2, (y + height) * 2, (x + width) * 2);
     else if (gGfx3DSMode == GFX_3DS_MODE_WIDE)
-        C3D_SetViewport(y, x * 2, height, width * 2);
-    else
-        C3D_SetViewport(y, x, height, width);
+        C3D_SetScissor(GPU_SCISSOR_NORMAL, y, x * 2, y + height, (x + width) * 2);
 }
 
 static void gfx_citro3d_set_scissor(int x, int y, int width, int height)
@@ -919,8 +1074,22 @@ static void applyAlphaTest(void)
         C3D_AlphaTest(true, GPU_GREATER, 0);
 }
 
+/* PORT (2026-10-30): the N64 blender's ADDITIVE modes (P * A + MEM * 1: light shafts, glows, G_RM_ADD...). Only
+ * "P * A + MEM * (1 - A)" blended before; additive draws went out opaque - the Deku Palace garden's sun shafts lay on
+ * the ground as solid flat bands, popping in and out as their animation changed (user report, marked screenshots).
+ * 0 = not additive, 1 = A from the combiner (source alpha), 2 = A = fog colour alpha (sBlendConstA). */
+static int sBlendAdd, sBlendConstA;
 static void applyBlend()
 {
+    if (sUseBlend && sBlendAdd == 1) {
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE, GPU_ZERO, GPU_ONE);
+        return;
+    }
+    if (sUseBlend && sBlendAdd == 2) {
+        C3D_BlendingColor((u32)(sBlendConstA & 0xFF) << 24);
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_CONSTANT_ALPHA, GPU_ONE, GPU_ZERO, GPU_ONE);
+        return;
+    }
     if (sUseBlend)
         C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
     else
@@ -929,8 +1098,16 @@ static void applyBlend()
 
 static void gfx_citro3d_set_use_alpha(bool use_alpha)
 {
-    if (sRec) recOp(OP_ALPHA, use_alpha, 0, 0, 0);
+    if (sRec) recOp(OP_ALPHA, use_alpha, sBlendAdd, sBlendConstA, 0);
     sUseBlend = use_alpha;
+    applyBlend();
+}
+
+void gfx_citro3d_set_blend_add(int mode, int constA) {
+    if (mode == sBlendAdd && constA == sBlendConstA) return;
+    sBlendAdd = mode;
+    sBlendConstA = constA;
+    if (sRec) recOp(OP_ALPHA, sUseBlend, sBlendAdd, sBlendConstA, 0);
     applyBlend();
 }
 
@@ -1037,7 +1214,161 @@ static void submitDraw(u32 count, u32 first, const u16* idx) {
     submitDraw_impl(count, first, idx);
     gPortProf = prev;
 }
+extern int gPortGDbg, gPortGpuVtx;
+#define GPU_STRIDE 56
+extern int PortGfx_DlogOn(void);
+extern uint32_t PortGfx_DlogBatch(void);
+extern void PortGfx_DlogLine(const char* s);
+extern int PortGfx_DlogMulti(void);
+extern int PortGfx_DlogFrame(void);
+/* TEMPORARY: the draw as the GPU gets it - counts, both bound textures' real parameters (size, format, wrap, filter, lod,
+ * pool scale) and a checksum of the texture memory as it is at this moment, the first vertices as raw words */
+static void dlogTexGpu(char* b, size_t n, int unit) {
+    const C3D_Tex* t = &sTexturePool[sTexUnits[unit]];
+    uint32_t h = 2166136261u;
+    const uint8_t* d = (const uint8_t*)t->data;
+    size_t i, sz = t->size < 65536 ? t->size : 65536;
+    uint32_t sum[4] = { 0, 0, 0, 0 };
+    if (PortGfx_DlogMulti() && PortGfx_DlogFrame() != 1) sz = 0; /* (the multi-frame capture: checksums in its first frame only) */
+    if (d == NULL) sz = 0;
+    for (i = 0; i < sz; i++) h = (h ^ d[i]) * 16777619u;
+    if (t->fmt == GPU_RGBA8) { /* (2026-11-11) the average texel as the GPU holds it: R G B A (stored A B G R) */
+        for (i = 0; i + 3 < sz; i += 4) sum[0] += d[i + 3], sum[1] += d[i + 2], sum[2] += d[i + 1], sum[3] += d[i];
+    }
+    snprintf(b, n, " | t%d pool=%d %ux%u fmt=%d size=%u param=%08x lod=%04x/%u/%u scale=%.5f/%.5f data=%p crc=%08x avg=%u,%u,%u,%u", unit,
+             sTexUnits[unit], (unsigned)t->width, (unsigned)t->height, (int)t->fmt, (unsigned)t->size, (unsigned)t->param,
+             (unsigned)t->lodBias, (unsigned)t->maxLevel, (unsigned)t->minLevel, (double)sTexturePoolScaleS[sTexUnits[unit]],
+             (double)sTexturePoolScaleT[sTexUnits[unit]], (const void*)t->data, (unsigned)h, (unsigned)(sz >= 4 ? sum[0] / (sz / 4) : 0),
+             (unsigned)(sz >= 4 ? sum[1] / (sz / 4) : 0), (unsigned)(sz >= 4 ? sum[2] / (sz / 4) : 0), (unsigned)(sz >= 4 ? sum[3] / (sz / 4) : 0));
+}
+/* (TEMPORARY, 2026-11-11) a GPU-path draw as the GPU itself will compute it, from the vertex buffer and the uniforms as they
+ * stand for this draw (palette rows, the near-plane limit): how much of it lands on the screen, its w / z / depth range, the
+ * texture coordinates and shade (alpha = fog) it carries. The CPU-side log (P / M lines) says what was meant. */
+static int sPalLoc;   /* (defined with the GPU path below) */
+static int sRemapLoc; /* (defined with setRemap below) */
+static float dlogClipArea(const float v[3][3]) { /* screen area (pixels of 400x240) of a clip-space (x, y, w) triangle */
+    float poly[12][3], tmp[12][3];
+    int n = 3, pl, i, k;
+    double a = 0.0;
+    for (i = 0; i < 3; i++) poly[i][0] = v[i][0], poly[i][1] = v[i][1], poly[i][2] = v[i][2];
+    for (pl = 0; pl < 5 && n >= 3; pl++) {
+        int m = 0;
+        for (i = 0; i < n; i++) {
+            const float* p = poly[i];
+            const float* q = poly[(i + 1) % n];
+            float dp = pl == 0 ? p[2] + p[0] : pl == 1 ? p[2] - p[0] : pl == 2 ? p[2] + p[1] : pl == 3 ? p[2] - p[1] : p[2] - 1e-3f;
+            float dq = pl == 0 ? q[2] + q[0] : pl == 1 ? q[2] - q[0] : pl == 2 ? q[2] + q[1] : pl == 3 ? q[2] - q[1] : q[2] - 1e-3f;
+            if (dp >= 0.0f && m < 12) {
+                for (k = 0; k < 3; k++) tmp[m][k] = p[k];
+                m++;
+            }
+            if ((dp >= 0.0f) != (dq >= 0.0f) && m < 12) {
+                float t = dp / (dp - dq);
+                for (k = 0; k < 3; k++) tmp[m][k] = p[k] + t * (q[k] - p[k]);
+                m++;
+            }
+        }
+        memcpy(poly, tmp, sizeof(float) * 3 * m);
+        n = m;
+    }
+    for (i = 0; n >= 3 && i < n; i++) {
+        const float* p = poly[i];
+        const float* q = poly[(i + 1) % n];
+        a += (double)(p[0] / p[2] * 200.0f) * (q[1] / q[2] * 120.0f) - (double)(q[0] / q[2] * 200.0f) * (p[1] / p[2] * 120.0f);
+    }
+    return (float)(a < 0 ? -a : a) * 0.5f;
+}
+static void dlogGpuEye(u32 count, const u16* idx) {
+    const uint8_t* base = (const uint8_t*)sVboBuffer;
+    float uvlo[4] = { 1e30f, 1e30f, 1e30f, 1e30f }, uvhi[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
+    float wlo = 1e30f, whi = -1e30f, zlo = 1e30f, zhi = -1e30f, dlo = 1e30f, dhi = -1e30f, area = 0.0f, zlim;
+    int clo[4] = { 255, 255, 255, 255 }, chi[4] = { 0, 0, 0, 0 }, plo = 255, phi = 0, nz = 0, nd = 0, nOn = 0;
+    char c[400];
+    u32 i;
+    int k, r;
+    if (sPalLoc < 0 || sRemapLoc < 0 || base == NULL) return;
+    zlim = C3D_FVUnif[GPU_VERTEX_SHADER][sRemapLoc].z;
+    for (i = 0; i + 2 < count; i += 3) {
+        float cv[3][3], a;
+        for (k = 0; k < 3; k++) {
+            const uint8_t* v = base + (size_t)idx[i + k] * GPU_STRIDE;
+            float pos[4], uv[4], dp[4], o[4];
+            uint8_t sh[4], pi;
+            memcpy(pos, v, 16);
+            memcpy(uv, v + 16, 16);
+            memcpy(dp, v + 32, 16);
+            memcpy(sh, v + 48, 4);
+            pi = v[52];
+            for (r = 0; r < 4; r++) {
+                if (uv[r] < uvlo[r]) uvlo[r] = uv[r];
+                if (uv[r] > uvhi[r]) uvhi[r] = uv[r];
+                if (sh[r] < clo[r]) clo[r] = sh[r];
+                if (sh[r] > chi[r]) chi[r] = sh[r];
+            }
+            if (pi < plo) plo = pi;
+            if (pi > phi) phi = pi;
+            if (dp[0] != 0.0f || dp[1] != 0.0f || dp[2] != 0.0f) nd++;
+            for (r = 0; r < 4; r++) { /* the shader: dp4 with the palette entry's rows (no skinned delta at 20 fps) */
+                const C3D_FVec* u = &C3D_FVUnif[GPU_VERTEX_SHADER][sPalLoc + pi * 4 + r];
+                o[r] = u->x * pos[0] + u->y * pos[1] + u->z * pos[2] + u->w * pos[3];
+            }
+            if (o[2] > zlim) o[2] = zlim; /* (min with remap.z: the NoN near-plane clamp) */
+            if (o[3] < wlo) wlo = o[3];
+            if (o[3] > whi) whi = o[3];
+            if (o[3] > 0.0f) {
+                float z = o[2] / o[3], dep = sDbgScale * o[2] + sDbgOff * o[3];
+                if (z < zlo) zlo = z;
+                if (z > zhi) zhi = z;
+                if (dep < dlo) dlo = dep;
+                if (dep > dhi) dhi = dep;
+                if (z > 0.0f || z < -1.0f) nz++;
+            }
+            /* back to the N64 clip space of the P lines: out = (y', -x') */
+            cv[k][0] = -o[1], cv[k][1] = o[0], cv[k][2] = o[3];
+        }
+        a = dlogClipArea((const float(*)[3])cv);
+        area += a;
+        nOn += a > 0.0f;
+    }
+    snprintf(c, sizeof(c), "GE tris=%u onscreen=%d area=%.0f w=%.1f..%.1f z/w=%.4f..%.4f(out %d) depth=%.5f..%.5f uv0=%.2f..%.2f,%.2f..%.2f "
+             "uv1=%.2f..%.2f,%.2f..%.2f shade=%d..%d,%d..%d,%d..%d a=%d..%d pal=%d..%d moved=%d zlim=%g\n",
+             (unsigned)(count / 3), nOn, (double)area, (double)wlo, (double)whi, (double)zlo, (double)zhi, nz, (double)dlo, (double)dhi,
+             (double)uvlo[0], (double)uvhi[0], (double)uvlo[1], (double)uvhi[1], (double)uvlo[2], (double)uvhi[2], (double)uvlo[3],
+             (double)uvhi[3], clo[0], chi[0], clo[1], chi[1], clo[2], chi[2], clo[3], chi[3], plo, phi, nd, (double)zlim);
+    PortGfx_DlogLine(c);
+}
+static int sRawMode;  /* (defined with the raw path below) */
+static int sCullMode; /* (defined with gfx_citro3d_gpu_cull below) */
+static void dlogDraw(u32 count, u32 first, const u16* idx) {
+    char a[256], b[256], c[900];
+    int k;
+    if (!PortGfx_DlogOn() || count < 3) return; /* PORT (2026-11-10, TEMPORARY): every draw, raw ones and the GPU state too */
+    dlogTexGpu(a, sizeof(a), 0);
+    dlogTexGpu(b, sizeof(b), 1);
+    {
+        u32 id = sShaderProgramPool[sCurShader].shader_id1;
+        int want = !(id & SHADER_OPT_ALPHA) ? 0 : (id & SHADER_OPT_TEXTURE_EDGE) ? (sUseBlend ? 1 : 2) : 3;
+        snprintf(c, sizeof(c), "G batch=%u id=%d cnt=%u first=%u idx=%d raw=%d gpu=%d dbg=%d mode=%d | cull=%d dt=%d dw=%d dec=%d xlu=%d room=%d "
+                 "lin=%.2f br=%d sc=%g off=%g alpha=%d blend=%d add=%d vp=%d,%d,%d,%d sc=%d,%d,%d,%d remap=%g,%g sh=%08x%s%s\n",
+                 (unsigned)PortGfx_DlogBatch(), sDrawId, (unsigned)count, (unsigned)first, idx != NULL, sRawMode, gPortGpuVtx, gPortGDbg,
+                 (int)gGfx3DSMode, sCullMode, sDepthTestOn, sDepthUpdateOn, sDepthDecal, sDepthXlu, sDepthRoom, (double)sDepthLinN,
+                 sDbgBranch, (double)sDbgScale, (double)sDbgOff, want, sUseBlend, sBlendAdd, sVp[0], sVp[1], sVp[2], sVp[3], sSc[0],
+                 sSc[1], sSc[2], sSc[3], (double)sVpRemap[0], (double)sVpRemap[1], (unsigned)id, a, b);
+    }
+    PortGfx_DlogLine(c);
+    if (idx != NULL && sVboBuffer != NULL && !sRawMode && gPortGpuVtx && PortGfx_DlogFrame() == 1) {
+        dlogGpuEye(count, idx);
+    }
+    if (idx != NULL && sVboBuffer != NULL && !sRawMode && !PortGfx_DlogMulti()) { /* first indices and the vertex words they point at (stride unknown here: 56 B GPU layout) */
+        for (k = 0; k < 6 && (u32)k < count; k++) {
+            const uint32_t* w = (const uint32_t*)((const uint8_t*)sVboBuffer + (size_t)idx[k] * (gPortGpuVtx ? GPU_STRIDE : VTX_FLOATS * 4));
+            snprintf(c, sizeof(c), "GV %u:%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", (unsigned)idx[k], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], gPortGpuVtx ? w[13] : 0u);
+            PortGfx_DlogLine(c);
+        }
+    }
+}
 static void submitDraw_impl(u32 count, u32 first, const u16* idx) {
+    dlogDraw(count, first, idx);
     applyAlphaTest();
     applyDrawId();
     if (gGfx3DSMode == GFX_3DS_MODE_STEREO && !Port3ds_IsOffscreen()) {
@@ -1073,7 +1404,7 @@ static void submitDraw_impl(u32 count, u32 first, const u16* idx) {
         }
     } else {
         setEye(0.0f);
-        setRemap(1.0f, 0.0f);
+        setRemap(sVpRemap[0], sVpRemap[1]);
         if (idx != NULL) {
             C3D_DrawElements(GPU_TRIANGLES, count, C3D_UNSIGNED_SHORT, idx);
         } else {
@@ -1172,6 +1503,7 @@ static void gfx_citro3d_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size
 #define IDX_CAP (96 * 1024)
 static u16* sIdxBuf;
 static u32 sIdxPos, sIdxStart;
+static u32 sIdxPlain; /* indices of this batch pushed for anything but a CPU-cut piece (gfx_citro3d_idx_push) */
 
 /* n vertices at the end of this frame's VBO; NULL when full (index of the first in *first) */
 float* gfx_citro3d_vtx_reserve(u32 n, u32* first) {
@@ -1208,23 +1540,55 @@ int gfx_citro3d_idx_push(u32 a, u32 b, u32 c) {
     sIdxBuf[sIdxPos++] = (u16)a;
     sIdxBuf[sIdxPos++] = (u16)b;
     sIdxBuf[sIdxPos++] = (u16)c;
+    sIdxPlain += 3;
     return 1;
+}
+
+/* the same for a piece of a triangle cut on the CPU (gfx_pc.c gpu_pack_clip_tri): three new vertices */
+int gfx_citro3d_idx_push_piece(u32 a, u32 b, u32 c) {
+    if (!gfx_citro3d_idx_push(a, b, c)) {
+        return 0;
+    }
+    sIdxPlain -= 3;
+    return 1;
+}
+
+/* PORT (2026-11-14, Milk Road wall): a GPU-path batch made only of the pieces of CPU-cut triangles (their indices count
+ * up, three new vertices each) goes out as a plain array draw: drawn through the index buffer, Milk Road's cliff and
+ * ground pieces vanished at some camera angles (the draw log showed their vertex data was right). 2026-11-12 to 11-14
+ * this covered EVERY batch whose indices count up, and the GPU hung on Goron roll / Deku spin (removed on 11-14: no
+ * hang, but the wall was back - user tests); pieces alone were drawn this way everywhere in those builds without a
+ * hang. Recorded for the replays as OP_DRAWIDX v[2]. */
+static void submitIndexed(u32 start, u32 n, int pieces) {
+    const u16* ix = sIdxBuf + start;
+    u32 i = 0;
+    if (pieces && !sRawMode && gPortGpuVtx) {
+        for (i = 1; i < n && ix[i] == (u16)(ix[0] + i); i++) {
+        }
+    }
+    if (i == n) {
+        submitDraw(n, ix[0], NULL);
+    } else {
+        submitDraw(n, 0, ix);
+    }
 }
 
 /* draw the indices pushed since the last batch */
 void gfx_citro3d_draw_indexed(void) {
     u32 n = sIdxPos - sIdxStart;
+    int pieces = sIdxPlain == 0;
+    sIdxPlain = 0;
     if (n == 0) {
         return;
     }
     if (sRec) { /* drawn by the replays (direct capture: also now) */
-        recOp(OP_DRAWIDX, (int)sIdxStart, (int)n, 0, 0);
+        recOp(OP_DRAWIDX, (int)sIdxStart, (int)n, pieces, 0);
         if (!sRecDirect) {
             sIdxStart = sIdxPos;
             return;
         }
     }
-    submitDraw(n, 0, sIdxBuf + sIdxStart);
+    submitIndexed(sIdxStart, n, pieces);
     sIdxStart = sIdxPos;
     {
         extern u32 gPortPerfTris, gPortPerfDraws;
@@ -1572,10 +1936,18 @@ static void gfx_citro3d_init(void)
     C3D_AlphaTest(true, GPU_GREATER, 0x00);
 }
 
+/* (TEMPORARY, 2026-11-11) this frame's buffer use so far: GPU-path vertices, raw vertices, triangles (each with its cap) */
+void gfx_citro3d_usage(u32 out[6]) {
+    out[0] = (u32)sBufIdx, out[1] = GPU_VERTS;
+    out[2] = (u32)sRawIdx, out[3] = RAW_VBO_BYTES / RAW_STRIDE;
+    out[4] = sIdxPos / 3, out[5] = IDX_CAP / 3;
+}
+
 static void gfx_citro3d_start_frame(void) {
     sBufIdx = 0;
     sRawIdx = 0;
     sIdxPos = sIdxStart = 0;
+    sIdxPlain = 0;
 }
 
 /* PORT (2026-09-30): the vertex buffer is cached linear memory written by the CPU every frame; the GPU
@@ -1583,7 +1955,14 @@ static void gfx_citro3d_start_frame(void) {
  * data cache (the New 3DS has a 2 MB L2): intermittent hardware-only glitches - a ghost of a previous
  * frame's Link in the pause preview, stray pixel lines. Azahar has no CPU cache model, so it never
  * showed. Called by gfx_3ds.c right before C3D_FrameEnd submits the frame's commands. */
+extern int gPortGDbg;
 void gfx_citro3d_flush_vbo(void) {
+    if (gPortGDbg == 20 || gPortGDbg == 22 || gPortGDbg == 23) { /* TEMPORARY Ground debug test: every byte of every vertex/index buffer, whatever the counters say */
+        Port3ds_CacheFlush(sVboBuffer, VBO_BYTES);
+        Port3ds_CacheFlush(sIdxBuf, IDX_CAP * sizeof(u16));
+        Port3ds_CacheFlush(sRawVbo, RAW_VBO_BYTES);
+        return;
+    }
     if (sBufIdx > 0) {
         Port3ds_CacheFlush(sVboBuffer, sBufIdx * (gPortGpuVtx ? GPU_STRIDE : VTX_FLOATS * sizeof(float)));
     }
@@ -1810,8 +2189,8 @@ static void recInitialState(void) {
     }
     recOp(OP_DTEST, sDepthTestOn, 0, 0, 0);
     recOp(OP_DMASK, sDepthUpdateOn, 0, 0, 0);
-    recOp(OP_DECAL, sDepthDecal, 0, 0, 0);
-    recOp(OP_ALPHA, sUseBlend, 0, 0, 0);
+    recOp(OP_DECAL, sDepthDecal, depth_lin_bits(), sDepthXlu, sDepthRoom);
+    recOp(OP_ALPHA, sUseBlend, sBlendAdd, sBlendConstA, 0);
     recOp(OP_DRAWID, sDrawId, 0, 0, 0);
     recOp(OP_STEREO, sStereoMode, 0, 0, 0);
     recOp(OP_CULL, sCullMode, 0, 0, 0);
@@ -1930,6 +2309,9 @@ void gfx_citro3d_replay(void) {
                 gfx_citro3d_set_depth_mask(o->v[0] != 0);
                 break;
             case OP_DECAL:
+                memcpy(&sDepthLinN, &o->v[1], sizeof(sDepthLinN));
+                sDepthXlu = o->v[2] != 0;
+                sDepthRoom = o->v[3];
                 gfx_citro3d_set_zmode_decal(o->v[0] != 0);
                 break;
             case OP_VIEWPORT:
@@ -1939,6 +2321,7 @@ void gfx_citro3d_replay(void) {
                 gfx_citro3d_set_scissor(o->v[0], o->v[1], o->v[2], o->v[3]);
                 break;
             case OP_ALPHA:
+                sBlendAdd = o->v[1], sBlendConstA = o->v[2];
                 gfx_citro3d_set_use_alpha(o->v[0] != 0);
                 break;
             case OP_DRAWID:
@@ -1969,7 +2352,7 @@ void gfx_citro3d_replay(void) {
                 sTexBoundOk[o->v[0]] = true;
                 break;
             case OP_DRAWIDX:
-                submitDraw((u32)o->v[1], 0, sIdxBuf + o->v[0]);
+                submitIndexed((u32)o->v[0], (u32)o->v[1], o->v[2]);
                 {
                     extern u32 gPortPerfTris, gPortPerfDraws;
                     gPortPerfTris += (u32)o->v[1] / 3;

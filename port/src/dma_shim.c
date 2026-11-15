@@ -39,9 +39,82 @@ void PortDma_Init(const char* romPath) {
     PortDma_CacheAudio();
 }
 
-static void ReadRom(void* dst, uintptr_t vrom, u32 n) {
+/* PORT (2026-10-26): a block cache in front of the SD card. Compressed files are decompressed from many small reads
+ * (Yaz0 refills a small buffer again and again), and every read was its own fseek + fread through the SD card service:
+ * pausing (the pause screen's item, map and name archives) took 2-3 seconds (user report). Reads under 256 KB go
+ * through 64 KB blocks kept in linear memory (LRU, 2 MB): one SD read per block, and the next pause reads none. */
+#define ROMC_BLOCK (64 * 1024)
+#define ROMC_COUNT 32
+extern void* linearAlloc(u32 size);
+static u8* sRomcData;
+static u32 sRomcBlock[ROMC_COUNT]; /* block index + 1, 0 = empty */
+static u32 sRomcUse[ROMC_COUNT], sRomcClock;
+static int sRomcState; /* 0 untried, 1 ready, -1 no memory */
+/* (libctru's LightLock: reads can come from the game and audio threads) */
+typedef int PortLightLock;
+extern void LightLock_Init(PortLightLock* lock);
+extern void LightLock_Lock(PortLightLock* lock);
+extern void LightLock_Unlock(PortLightLock* lock);
+static PortLightLock sRomLock;
+
+static void ReadRomDirect(void* dst, uintptr_t vrom, u32 n) {
     fseek(sRomFile, (long)vrom, SEEK_SET);
     fread(dst, 1, n, sRomFile);
+}
+
+static const u8* RomcGet(u32 block) {
+    int i, victim = 0;
+    for (i = 0; i < ROMC_COUNT; i++) {
+        if (sRomcBlock[i] == block + 1) {
+            sRomcUse[i] = ++sRomcClock;
+            return sRomcData + (u32)i * ROMC_BLOCK;
+        }
+        if (sRomcUse[i] < sRomcUse[victim]) victim = i;
+    }
+    {
+        u32 start = block * ROMC_BLOCK, len = ROMC_BLOCK;
+        if (start >= sRomSize) return NULL;
+        if (start + len > sRomSize) len = sRomSize - start;
+        ReadRomDirect(sRomcData + (u32)victim * ROMC_BLOCK, start, len);
+        sRomcBlock[victim] = block + 1;
+        sRomcUse[victim] = ++sRomcClock;
+        return sRomcData + (u32)victim * ROMC_BLOCK;
+    }
+}
+
+static void ReadRomCached(void* dst, uintptr_t vrom, u32 n);
+static void ReadRom(void* dst, uintptr_t vrom, u32 n) {
+    static int sLockInit;
+    if (!sLockInit) {
+        sLockInit = 1;
+        LightLock_Init(&sRomLock);
+    }
+    LightLock_Lock(&sRomLock);
+    ReadRomCached(dst, vrom, n);
+    LightLock_Unlock(&sRomLock);
+}
+static void ReadRomCached(void* dst, uintptr_t vrom, u32 n) {
+    if (sRomcState == 0) {
+        sRomcData = linearAlloc(ROMC_BLOCK * ROMC_COUNT);
+        sRomcState = sRomcData != NULL ? 1 : -1;
+    }
+    if (sRomcState < 0 || n >= 256 * 1024 || vrom + n > sRomSize) {
+        ReadRomDirect(dst, vrom, n);
+        return;
+    }
+    while (n > 0) {
+        u32 block = (u32)vrom / ROMC_BLOCK, off = (u32)vrom % ROMC_BLOCK, k = ROMC_BLOCK - off;
+        const u8* b = RomcGet(block);
+        if (k > n) k = n;
+        if (b == NULL) {
+            ReadRomDirect(dst, vrom, n);
+            return;
+        }
+        memcpy(dst, b + off, k);
+        dst = (u8*)dst + k;
+        vrom += k;
+        n -= k;
+    }
 }
 #define ROM_READY() (sRomFile != NULL)
 
@@ -69,8 +142,28 @@ static void PortDma_CacheAudio(void) {
         fprintf(stderr, "[dma] no memory to cache audio (%u bytes): streaming it\n", n);
         return;
     }
-    ReadRom(sAudioRom, sAudioRomStart, n);
+    ReadRomDirect(sAudioRom, sAudioRomStart, n);
     fprintf(stderr, "[dma] audio ROM cached in RAM: %u bytes\n", n);
+}
+
+/* PORT (2026-11-12): the CRC-32 (zlib's) of the audio range just read, to catch a damaged ROM file at boot (a bad copy
+ * on a 2DS's SD card: the first soundfont came out malformed and the game stopped). 1 = *crc set, 0 = not cached. */
+int PortDma_AudioCheck(u32* crc) {
+    static u32 sTab[256];
+    u32 c = 0xFFFFFFFFu, i, k;
+    if (sAudioRom == NULL) {
+        return 0;
+    }
+    for (i = 0; i < 256; i++) {
+        u32 t = i;
+        for (k = 0; k < 8; k++) t = (t & 1) ? 0xEDB88320u ^ (t >> 1) : t >> 1;
+        sTab[i] = t;
+    }
+    for (i = 0; i < (u32)(sAudioRomEnd - sAudioRomStart); i++) {
+        c = sTab[(c ^ sAudioRom[i]) & 0xFF] ^ (c >> 8);
+    }
+    *crc = ~c;
+    return 1;
 }
 
 /* audio-range request served from RAM? (then no SD read, and no texture cache can live there) */
@@ -132,12 +225,18 @@ static void Dma_Copy_Impl(void* ram, uintptr_t vrom, u32 size);
 /* Every DMA destination may hold a cached texture (buffers are reused in place): invalidate it. */
 static void Dma_Copy(void* ram, uintptr_t vrom, u32 size) {
 #ifdef __3DS__
+    { /* PORT (2026-11-12): the last ROM read, for the log if the game stops (3ds_main.c Port3ds_FatalTail) */
+        extern unsigned gPortLastDma[4];
+        gPortLastDma[0] = (unsigned)vrom, gPortLastDma[1] = (unsigned)(unsigned long)ram, gPortLastDma[2] = size;
+        gPortLastDma[3]++;
+    }
     if (PortDma_ReadAudio(ram, vrom, size)) {
         return;
     }
 #endif
-    Dma_Copy_Impl(ram, vrom, size);
+    /* (first: it also unmarks N64-order data that was here before; Dma_Copy_Impl marks what it reads from the ROM) */
     gfx_texture_cache_invalidate_range(ram, size);
+    Dma_Copy_Impl(ram, vrom, size);
 }
 static void Dma_Copy_Impl(void* ram, uintptr_t vrom, u32 size) {
     u32 i;
@@ -194,6 +293,15 @@ static void Dma_Copy_Impl(void* ram, uintptr_t vrom, u32 size) {
     }
 #endif
     ReadRom(ram, vrom, size);
+#ifdef __3DS__
+    {
+        /* PORT (2026-10-26): ROM bytes in N64 order (the segments not compiled natively: baserom blobs such as
+         * anime_texture_*_static and gameplay_object_exchange_static): textures here are read without the ^ 7
+         * unswizzle (gfx_pc.c gfx_mark_logical_texture), like the unpacked archives */
+        extern void gfx_mark_logical_texture(const void* start, unsigned long size);
+        gfx_mark_logical_texture(ram, size);
+    }
+#endif
 }
 
 /* --- public DmaMgr API (signatures per src/boot/z_std_dma.c) --- */

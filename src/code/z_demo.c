@@ -1,4 +1,5 @@
 #include "PR/ultratypes.h"
+#include "port_minimap.h"
 
 #pragma increment_block_number "n64-us:128"
 
@@ -1592,6 +1593,9 @@ void Cutscene_HandleEntranceTriggers(PlayState* play) {
 }
 
 void func_800EDDB0(PlayState* play) {
+#ifdef __3DS__
+    PortEnh_TransitionCs(play); /* PORT: skip the intro / Song of Time transition (ultra_shims.c) */
+#endif
 }
 
 void func_800EDDBC(UNK_TYPE arg0, UNK_TYPE arg1) {

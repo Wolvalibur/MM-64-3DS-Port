@@ -5,6 +5,7 @@
  */
 
 #include "z_en_test7.h"
+#include "port_minimap.h"
 #include "assets/objects/gameplay_keep/gameplay_keep.h"
 
 #define FLAGS                                                                                              \
@@ -372,6 +373,43 @@ void EnTest7_Init(Actor* thisx, PlayState* play2) {
     EnTest7* this = (EnTest7*)thisx;
     Player* player = GET_PLAYER(play);
     Player* player2 = GET_PLAYER(play);
+
+#ifdef __3DS__
+    /* PORT (2026-10-26): skip the Song of Soaring cutscene (2Ship2Harkinian SkipSoaringCutscene): straight to the
+     * fade-out and the warp */
+    if (gPortSkipCutscenes && (OWL_WARP_CS_GET_OCARINA_MODE(&this->actor) != ENTEST7_ARRIVE)) {
+        this->lightNode = NULL;
+        if (play->sceneId == SCENE_SECOM) {
+            play->nextEntrance = ENTRANCE(IKANA_CANYON, 6);
+        } else if (OWL_WARP_CS_GET_OCARINA_MODE(&this->actor) == OCARINA_MODE_WARP_TO_ENTRANCE) {
+            func_80169F78(play);
+            gSaveContext.respawn[RESPAWN_MODE_TOP].playerParams =
+                PLAYER_PARAMS(gSaveContext.respawn[RESPAWN_MODE_TOP].playerParams, PLAYER_START_MODE_OWL);
+            gSaveContext.respawnFlag = -6;
+        } else {
+            static const u16 sPortOwlEntrances[] = {
+                ENTRANCE(GREAT_BAY_COAST, 11),         ENTRANCE(ZORA_CAPE, 6),
+                ENTRANCE(SNOWHEAD, 3),                 ENTRANCE(MOUNTAIN_VILLAGE_WINTER, 8),
+                ENTRANCE(SOUTH_CLOCK_TOWN, 9),         ENTRANCE(MILK_ROAD, 4),
+                ENTRANCE(WOODFALL, 4),                 ENTRANCE(SOUTHERN_SWAMP_POISONED, 10),
+                ENTRANCE(IKANA_CANYON, 4),             ENTRANCE(STONE_TOWER, 3),
+            };
+            play->nextEntrance =
+                sPortOwlEntrances[OWL_WARP_CS_GET_OCARINA_MODE(&this->actor) - OCARINA_MODE_WARP_TO_GREAT_BAY_COAST];
+            if ((play->nextEntrance == ENTRANCE(SOUTHERN_SWAMP_POISONED, 10)) &&
+                CHECK_WEEKEVENTREG(WEEKEVENTREG_CLEARED_WOODFALL_TEMPLE)) {
+                play->nextEntrance = ENTRANCE(SOUTHERN_SWAMP_CLEARED, 10);
+            } else if ((play->nextEntrance == ENTRANCE(MOUNTAIN_VILLAGE_WINTER, 8)) &&
+                       CHECK_WEEKEVENTREG(WEEKEVENTREG_CLEARED_SNOWHEAD_TEMPLE)) {
+                play->nextEntrance = ENTRANCE(MOUNTAIN_VILLAGE_SPRING, 8);
+            }
+        }
+        play->transitionTrigger = TRANS_TRIGGER_START;
+        play->transitionType = TRANS_TYPE_FADE_BLACK;
+        Actor_Kill(&this->actor);
+        return;
+    }
+#endif
 
     this->actor.world.rot.y = this->actor.shape.rot.y = player->actor.shape.rot.y;
     this->flags = 0;

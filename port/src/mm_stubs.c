@@ -54,7 +54,12 @@ void* PortGame_Calloc(size_t num, size_t size) {
 /* the system heap's memory: the N64's size, from the 3DS linear heap (like the OoT port's game arena) */
 void* PortGame_SystemHeapRegion(size_t size) {
     extern void* linearAlloc(size_t size);
-    return linearAlloc(size);
+    extern void PortDbgX(const char* label, unsigned val);
+    void* p = linearAlloc(size);
+    /* PORT (2026-11-12): logged - on an Old 3DS / 2DS this comes out of a much smaller linear heap */
+    PortDbgX("[mem] game system heap size", (unsigned)size);
+    PortDbgX("[mem] game system heap at (0 = not enough memory)", (unsigned)(unsigned long)p);
+    return p;
 }
 
 f32 qNaN0x10000 = 0.0f; /* set to the quiet NaN 0x7F810000 below (libc64/fp.s) */

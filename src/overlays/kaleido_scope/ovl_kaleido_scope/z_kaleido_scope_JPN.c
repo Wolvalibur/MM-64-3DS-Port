@@ -5,6 +5,7 @@
  */
 
 #include "z_kaleido_scope.h"
+#include "port_minimap.h" /* PORT: cheats */
 
 #include "sys_cmpdma.h"
 #include "z64map.h"
@@ -2869,7 +2870,7 @@ void KaleidoScope_Update(PlayState* play) {
             gSegments[0x08] = OS_K0_TO_PHYSICAL(pauseCtx->iconItemSegment);
 
             for (itemId = 0; itemId <= ITEM_BOW_FIRE; itemId++) {
-                if (!gPlayerFormItemRestrictions[GET_PLAYER_FORM][(s32)itemId]) {
+                if (!gPlayerFormItemRestrictions[GET_PLAYER_FORM][(s32)itemId] && !PORT_CHEAT_ON(CHEAT_UNRESTRICT)) {
                     KaleidoScope_GrayOutTextureRGBA32(Lib_SegmentedToVirtual(gItemIcons[(s32)itemId]),
                                                       ICON_ITEM_TEX_WIDTH * ICON_ITEM_TEX_HEIGHT);
                 }

@@ -48,6 +48,9 @@ f32 sSunColor;
 f32 sSunScale;
 f32 sSunPrimAlpha;
 s32 sSunDepthTestX;
+#ifdef __3DS__
+int gPortSunDepthWanted; /* the flare code set the test point this frame */
+#endif
 s32 sSunDepthTestY;
 f32 D_801F4F28;
 s16 sLightningFlashAlpha;
@@ -532,7 +535,18 @@ void Environment_JumpForwardInTime(void);
 void Environment_GraphCallback(GraphicsContext* gfxCtx, void* arg) {
     PlayState* play = (PlayState*)arg;
 
+#ifdef __3DS__
+    {
+        /* PORT: a 3DS depth read keeps a per-frame depth copy running: only while the sun's flare is being tested */
+        extern int gPortSunDepthWanted;
+        if (gPortSunDepthWanted) {
+            gPortSunDepthWanted = 0;
+            sSunScreenDepth = SysCfb_GetZBufferPixel(sSunDepthTestX, sSunDepthTestY);
+        }
+    }
+#else
     sSunScreenDepth = SysCfb_GetZBufferPixel(sSunDepthTestX, sSunDepthTestY);
+#endif
     Lights_GlowCheck(play);
 }
 
@@ -1804,7 +1818,45 @@ void Environment_DrawSun(PlayState* play) {
             Matrix_Scale(sSunScale, sSunScale, sSunScale, MTXMODE_APPLY);
             MATRIX_FINALIZE_AND_LOAD(POLY_OPA_DISP++, play->state.gfxCtx);
             Gfx_SetupDL54_Opa(play->state.gfxCtx);
+#ifdef __3DS__
+            {
+                // PORT (2026-10-26): gSunDL draws one 64x64 I4 texture (stored as gSun1/2/3Tex, 992 + 512 + 544 bytes)
+                // in three loads with tile tricks the renderer reproduces wrongly: four small suns in a square
+                // (user report). Drawn as 2 Ship 2 Harkinian does: the whole texture at once on one quad. The three
+                // pieces are joined into one buffer, since the build need not keep them adjacent in memory (all
+                // three are multiples of 8 bytes, so the asset arrays' 8-byte byte order carries over).
+                static u64 sSunTex[2048 / 8];
+                static u64 sSunEveningTex[2048 / 8];
+                static s32 sSunTexBuilt = false;
+                static Vtx sSunVtx[] = {
+                    VTX(-31, -31, 0, 0, 0, 255, 255, 255, 255),
+                    VTX(32, -31, 0, 2016, 0, 255, 255, 255, 255),
+                    VTX(-31, 32, 0, 0, 2016, 255, 255, 255, 255),
+                    VTX(32, 32, 0, 2016, 2016, 255, 255, 255, 255),
+                };
+
+                if (!sSunTexBuilt) {
+                    memcpy((u8*)sSunTex, gSun1Tex, 992);
+                    memcpy((u8*)sSunTex + 992, gSun2Tex, 512);
+                    memcpy((u8*)sSunTex + 1504, gSun3Tex, 544);
+                    memcpy((u8*)sSunEveningTex, gSunEvening1Tex, 992);
+                    memcpy((u8*)sSunEveningTex + 992, gSunEvening2Tex, 512);
+                    memcpy((u8*)sSunEveningTex + 1504, gSunEvening3Tex, 544);
+                    sSunTexBuilt = true;
+                }
+                gSPMatrix(POLY_OPA_DISP++, (Mtx*)0x01000000, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_MODELVIEW);
+                gDPPipeSync(POLY_OPA_DISP++);
+                gDPLoadTextureBlock_4b(POLY_OPA_DISP++, sSunTex, G_IM_FMT_I, 64, 64, 0, G_TX_NOMIRROR | G_TX_CLAMP,
+                                       G_TX_NOMIRROR | G_TX_CLAMP, 6, 6, G_TX_NOLOD, G_TX_NOLOD);
+                gDPLoadMultiBlock_4b(POLY_OPA_DISP++, sSunEveningTex, 0x0100, 1, G_IM_FMT_I, 64, 64, 0,
+                                     G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, 6, 6, G_TX_NOLOD,
+                                     G_TX_NOLOD);
+                gSPVertex(POLY_OPA_DISP++, sSunVtx, 4, 0);
+                gSP2Triangles(POLY_OPA_DISP++, 0, 1, 2, 0, 2, 1, 3, 0);
+            }
+#else
             gSPDisplayList(POLY_OPA_DISP++, gSunDL);
+#endif
         }
 
         CLOSE_DISPS(play->state.gfxCtx);
@@ -1931,14 +1983,33 @@ void Environment_DrawLensFlare(PlayState* play, EnvironmentContext* envCtx, View
         if (isSun) {
             Play_GetScreenPos(play, &pos, &screenPos);
             sSunDepthTestX = screenPos.x;
+#ifdef __3DS__
+            {
+                extern int gPortSunDepthWanted;
+                gPortSunDepthWanted = 1;
+            }
+#endif
             sSunDepthTestY = screenPos.y - 5.0f;
             if (sSunDepthTestY < 0) {
                 sSunDepthTestY = 0;
             }
+#ifdef __3DS__
+            {
+                /* PORT (2026-10-30): widescreen shows 40 more N64 pixels on each side: the sun there is on screen too
+                 * (zbuffer_port.c reads the depth there) */
+                extern int gPortWidescreen;
+                f32 ext = gPortWidescreen ? 40.0f : 0.0f;
+                if ((sSunScreenDepth != GPACK_ZDZ(G_MAXFBZ, 0)) || (screenPos.x < -ext) || (screenPos.y < 0.0f) ||
+                    (screenPos.x > SCREEN_WIDTH + ext) || (screenPos.y > SCREEN_HEIGHT)) {
+                    isOffScreen = true;
+                }
+            }
+#else
             if ((sSunScreenDepth != GPACK_ZDZ(G_MAXFBZ, 0)) || (screenPos.x < 0.0f) || (screenPos.y < 0.0f) ||
                 (screenPos.x > SCREEN_WIDTH) || (screenPos.y > SCREEN_HEIGHT)) {
                 isOffScreen = true;
             }
+#endif
         }
 
         for (i = 0; i < ARRAY_COUNT(sLensFlareTypes); i++) {

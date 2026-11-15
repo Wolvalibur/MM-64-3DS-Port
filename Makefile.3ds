@@ -125,7 +125,7 @@ OBJS       := $(GAME_OBJS) $(DEVKIT_OBJS) $(ASSET_OBJS) $(SHADER_OBJ) $(VERSION_
 # ============================================================================
 # RULES  (per-object flags via target-specific CFLAGS)
 # ============================================================================
-.PHONY: all elf dsx cci cia clean compile code FORCE
+.PHONY: all elf dsx cci cia cci-romfree cia-romfree clean compile code FORCE
 # The port targets a fixed-layout CCI (.3ds via makerom), NOT relocatable .3dsx (which
 # 3dsxtool rejects here and Azahar won't load). Default build = the linked ELF; package
 # with `cci` (needs makerom) for Azahar / hardware.
@@ -244,21 +244,40 @@ $(VERSION_OBJ): $(BUILD)/port_version.c ; @$(CC) $(PORT_CFLAGS) -c -o $@ $<
 ICON_PNG := $(if $(wildcard port/icon_local.png),port/icon_local.png,port/icon.png)
 $(BUILD)/$(TARGET).smdh: $(ICON_PNG)
 	@mkdir -p $(dir $@)
-	$(SMDHTOOL) --create "The Legend of Zelda: Majora's Mask N64 3DS Port" "The Legend of Zelda: Majora's Mask N64 3DS Port" "casrielasriel" $< $@
+	$(SMDHTOOL) --create "The Legend of Zelda: Majora's Mask N64 3DS Port" "The Legend of Zelda: Majora's Mask N64 3DS Port" "Wolvalibur" $< $@
 
-# HOME Menu banner: custom banner.bin, local banner, then the placeholder.
-BANNER := $(firstword $(wildcard port/banner.bin port/banner_local.bnr port/banner.bnr))
-# Title version in the CIA (1.0.2): a new version makes FBI install it as an update and the HOME Menu re-read the
-# icon and banner (it keeps them cached per title version)
+# HOME Menu banner: port/banner_local.bin when present (your own picture, made by tools/port/make_banner.py from a
+# banner.png / banner.jpg next to the builder; never committed), else banner.bin, the local banner, the placeholder.
+BANNER := $(firstword $(wildcard port/banner_local.bin port/banner.bin port/banner_local.bnr port/banner.bnr))
+# Title version in the CIA (1.0.4): a new version makes FBI install it as an update and the HOME Menu re-read the
+# icon and banner (it keeps them cached per title version). 1.0.4: the banner's mask and title spin together.
+# 1.0.5: the banner is the still Majora's Mask logo (a flat 256 x 128 picture, bannertool's layout).
+# 1.0.6: your own banner picture (banner.png next to the builder) is shown.
+# 1.0.7: a new icon (icon.png next to the builder).
+# 1.0.8: back to the earlier icon and the logo banner (the HOME Menu re-reads them only for a new version).
 TITLE_VER_MAJOR := 1
 TITLE_VER_MINOR := 0
-TITLE_VER_MICRO := 2
+TITLE_VER_MICRO := 8
 
 $(BUILD)/$(TARGET).3ds:  $(ELF) port/mm.rsf $(BUILD)/$(TARGET).smdh $(BANNER)
 	$(MAKEROM) -f cci -o $@ -rsf port/mm.rsf -target t -exefslogo -elf $< -icon $(BUILD)/$(TARGET).smdh -banner $(BANNER)
 $(BUILD)/$(TARGET).cia:  $(ELF) port/mm.rsf $(BUILD)/$(TARGET).smdh $(BANNER)
 	$(MAKEROM) -f cia -o $@ -rsf port/mm.rsf -target t -exefslogo -elf $< -icon $(BUILD)/$(TARGET).smdh -banner $(BANNER) \
 		-major $(TITLE_VER_MAJOR) -minor $(TITLE_VER_MINOR) -micro $(TITLE_VER_MICRO)
+
+# PORT (2026-11-07): the shareable package. The same program with every word of the game's data taken out (they come
+# back at boot from the player's own ROM: tools/port/gen_asset_tables.py --romfree, 3ds_main.c PortRomFree_Restore).
+# Only mm_romfree.cia / mm_romfree.3ds may be given to others; mm.cia / mm.3ds carry the game's data.
+ROMFREE_ROM ?= baseroms/$(VERSION)/baserom-decompressed.z64
+$(BUILD)/$(TARGET)_romfree.elf: $(ELF) tools/port/gen_asset_tables.py $(ROMFREE_ROM)
+	python3 tools/port/gen_asset_tables.py --romfree $< $(ROMFREE_ROM) $@
+$(BUILD)/$(TARGET)_romfree.3ds: $(BUILD)/$(TARGET)_romfree.elf port/mm.rsf $(BUILD)/$(TARGET).smdh $(BANNER)
+	$(MAKEROM) -f cci -o $@ -rsf port/mm.rsf -target t -exefslogo -elf $< -icon $(BUILD)/$(TARGET).smdh -banner $(BANNER)
+$(BUILD)/$(TARGET)_romfree.cia: $(BUILD)/$(TARGET)_romfree.elf port/mm.rsf $(BUILD)/$(TARGET).smdh $(BANNER)
+	$(MAKEROM) -f cia -o $@ -rsf port/mm.rsf -target t -exefslogo -elf $< -icon $(BUILD)/$(TARGET).smdh -banner $(BANNER) \
+		-major $(TITLE_VER_MAJOR) -minor $(TITLE_VER_MINOR) -micro $(TITLE_VER_MICRO)
+cci-romfree: $(BUILD)/$(TARGET)_romfree.3ds
+cia-romfree: $(BUILD)/$(TARGET)_romfree.cia
 
 clean: ; rm -rf $(BUILD)
 

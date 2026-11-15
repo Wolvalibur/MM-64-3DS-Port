@@ -351,7 +351,7 @@ static void gfx_3ds_handle_events(void)
 {
     if (!aptMainLoop()) {
         { extern void PortFlashrom_WaitIdle(void); PortFlashrom_WaitIdle(); }
-        { extern void Port3ds_AudioTaskWait(void); Port3ds_AudioTaskWait(); }
+        { extern void Port3ds_AudioTaskWaitExit(void); Port3ds_AudioTaskWaitExit(); } /* (bounded: see audio_3ds.c) */
         { extern void Port3ds_LogFlush(void); Port3ds_LogFlush(); } /* log lines the writer has not written */
         /* PORT (2026-09-30): shut graphics down before exit(). exit() unmaps the app heap, and libctru's
          * GSP event thread (stack on that heap) was still running: HOME -> Close crashed with a data
@@ -473,7 +473,72 @@ void Port3ds_RequestColor(void) {
 }
 
 int Port3ds_DrawIdActive(void) {
-    return sColorWantFrames > 0;
+    extern int PortGfx_DlogOn(void);
+    return sColorWantFrames > 0 || PortGfx_DlogOn(); /* (2026-11-12: also while the draw log runs, see id_stats_read) */
+}
+
+/* PORT (2026-11-12, TEMPORARY, Milk Road wall): while the draw log runs, every draw writes its id into the stencil buffer
+ * (applyDrawId, gfx_citro3d.c). After a logged frame, the whole depth/stencil buffer is read back before the next frame
+ * clears it, and only statistics are kept: how many pixels each draw id owns at the end of the frame, and their bounding
+ * box (buffer coordinates). The draw log prints them as "S" lines; its "G" lines carry each draw's id. That names the draw
+ * that really produced each part of the picture on the hardware - the draw log alone only says what was sent. */
+static int sIdStatsWant, sIdStatsReady, sIdW, sIdH;
+static u32 sIdCount[256];
+static u16 sIdBox[256][4];
+void Port3ds_IdStatsRequest(void) {
+    sIdStatsWant = 1;
+}
+static void id_stats_read(void) {
+    int w, h, x, y, i;
+    size_t size;
+    u32* buf;
+    sIdStatsWant = 0;
+    if (sTarget == NULL) {
+        return;
+    }
+    w = ViewW();
+    h = ViewH();
+    size = (size_t)w * h * 4;
+    buf = (u32*)linearAlloc(size);
+    if (buf == NULL) {
+        return;
+    }
+    /* the same transfer as gfx_3ds_read_back_depth (waits for the GPU to finish the frame) */
+    C3D_SyncDisplayTransfer((u32*)sTarget->frameBuf.depthBuf, GX_BUFFER_DIM(w, h), buf, GX_BUFFER_DIM(w, h),
+                            GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
+                                GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
+                                GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGBA8) |
+                                GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
+    GSPGPU_InvalidateDataCache(buf, size);
+    for (i = 0; i < 256; i++) {
+        sIdCount[i] = 0;
+        sIdBox[i][0] = sIdBox[i][1] = 0xFFFF;
+        sIdBox[i][2] = sIdBox[i][3] = 0;
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            u32 id = buf[(size_t)y * w + x] >> 24; /* D24S8: stencil in the top byte */
+            sIdCount[id]++;
+            if (x < sIdBox[id][0]) sIdBox[id][0] = (u16)x;
+            if (y < sIdBox[id][1]) sIdBox[id][1] = (u16)y;
+            if (x > sIdBox[id][2]) sIdBox[id][2] = (u16)x;
+            if (y > sIdBox[id][3]) sIdBox[id][3] = (u16)y;
+        }
+    }
+    linearFree(buf);
+    sIdW = w, sIdH = h;
+    sIdStatsReady = 1;
+}
+/* gfx_pc.c draw log: the statistics of the last logged frame, once (0 when there are none) */
+int Port3ds_IdStats(const u32** count, const u16 (**box)[4], int* w, int* h) {
+    if (!sIdStatsReady) {
+        return 0;
+    }
+    sIdStatsReady = 0;
+    *count = sIdCount;
+    *box = (const u16(*)[4])sIdBox;
+    *w = sIdW, *h = sIdH;
+    return 1;
 }
 
 int Port3ds_ColorLatestSlot(void) {
@@ -1016,7 +1081,11 @@ static void flip_thread(void* arg) {
                 const u8* fa = sFlipBuf[b];
                 const u8* fb = sFlipMode[b] == 2 ? fa + FLIP_BYTES / 2 : fa;
                 u32 mode = GSP_BGR8_OES | (sFlipMode[b] == 2 ? BIT(5) : sFlipMode[b] == 0 ? BIT(6) : 0) | (1 << 8);
-                if (gspHasGpuRight()) {
+                extern volatile int gPortAptSuspended;
+                /* PORT (2026-11-14): nothing presented once HOME is pressed: the system saves VRAM and hands the
+                 * shown screen to the HOME menu while this thread would still be switching buffers (HOME froze,
+                 * user report; 3ds_main.c Port3ds_FreezeWatch logs how far the switch got) */
+                if (gspHasGpuRight() && !gPortAptSuspended) {
                     gspPresentBuffer(GSP_SCREEN_TOP, swap, fa, fb, 240 * 3, mode);
                     swap ^= 1;
                 }
@@ -1293,6 +1362,7 @@ static bool gfx_3ds_start_frame(void)
          * a GX memory fill queued behind the previous frame's copies. */
         sFrameOpen = false;
         sInFrame = true;
+        sIdStatsWant = 0; /* (no wait for the GPU here: the draw-id statistics of that frame are skipped) */
         C3D_RenderTargetClear(sTarget, C3D_CLEAR_ALL, 0x000000FF, 0xFFFFFFFF);
         C3D_FrameDrawOn(sTarget);
         return true;
@@ -1304,6 +1374,9 @@ static bool gfx_3ds_start_frame(void)
             gfx_3ds_read_back_depth(); /* waits for that frame (as C3D_FrameBegin would), then copies */
             sDepthOfFrame = sFramesDone + 1; /* stands for the logic frame ending in this update */
         }
+    }
+    if (sIdStatsWant) {
+        id_stats_read(); /* (TEMPORARY draw log) the last logged frame's draw ids, before anything clears them */
     }
     {
         PHASE_IN(32); /* 3D on/off: render targets deleted and created */

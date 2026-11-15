@@ -46,6 +46,7 @@
 #include "z64camera.h"
 
 #include "global.h"
+#include "port_minimap.h"
 #include "string.h"
 #include "attributes.h"
 
@@ -2229,6 +2230,33 @@ s32 Camera_Normal1(Camera* camera) {
             spB4.pitch = Camera_CalcDefaultPitch(camera, sp9C.pitch, roData->unk_20, rwData->unk_08);
         }
     }
+
+#ifdef __3DS__
+    {
+        /* PORT (2026-10-26): the New 3DS C-stick turns the camera (3ds_main.c gPortCamX/Y; settings C-Stick: CAMERA),
+         * as in the OoT N64 3DS Port's Camera_Normal1: 180 degrees per second sideways and 90 up/down at full tilt.
+         * Released, the angle stays while Link stands still; once he moves the camera follows him as before. The MM
+         * port read the C-stick but no camera code used it (user report: the C-stick camera did nothing). */
+        extern s8 gPortCamX, gPortCamY;
+        static Camera* sPortCamHold;
+
+        if ((camera->status != CAM_STATUS_ACTIVE) || (camera->xzSpeed > 0.001f)) {
+            sPortCamHold = NULL;
+        }
+        if (((gPortCamX != 0) || (gPortCamY != 0)) && (camera->status == CAM_STATUS_ACTIVE)) {
+            spB4.yaw = sp9C.yaw - (s16)(gPortCamX * 13);
+            spB4.pitch = sp9C.pitch - (s16)(gPortCamY * 6);
+            /* (not below about 7 degrees under his head: lower, the eye only sinks into the ground at his feet) */
+            if ((gPortCamY > 0) && (spB4.pitch < -0x500)) {
+                spB4.pitch = MIN(sp9C.pitch, -0x500);
+            }
+            sPortCamHold = camera;
+        } else if (sPortCamHold == camera) {
+            spB4.yaw = sp9C.yaw;
+            spB4.pitch = sp9C.pitch;
+        }
+    }
+#endif
 
     // 76.9 degrees
     if (spB4.pitch > 0x36B0) {
@@ -7190,7 +7218,8 @@ void Camera_EarthquakeDay3(Camera* camera) {
         0x1FC, // 8 Large Earthquakes between CLOCK_TIME(4, 30) to CLOCK_TIME(6, 00)
     };
 
-    if ((CURRENT_DAY == 3) && (CutsceneManager_GetCurrentCsId() == CS_ID_NONE)) {
+    /* PORT (2026-11-08): 2S2H Accessibility/NoFinalDayQuakes (GAMEPLAY: No final-day quakes) */
+    if ((CURRENT_DAY == 3) && (CutsceneManager_GetCurrentCsId() == CS_ID_NONE) && !PORT_ENH(ENH_NO_QUAKES)) {
         time = CURRENT_TIME;
         timeSpeedOffset = gSaveContext.save.timeSpeedOffset;
 

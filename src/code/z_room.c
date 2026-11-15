@@ -9,6 +9,31 @@ void Room_Noop(PlayState* play, Room* room, Input* input, s32 arg3) {
 void Room_DrawNone(PlayState* play, Room* room, u32 flags) {
 }
 
+#ifdef __3DS__
+/* PORT (2026-10-31): room geometry is bracketed by G_NOOP tags (gfx_pc.c sInRoomDl): the renderer settles depth ties
+ * between the room and what is drawn over it (actors) as the RDP does - see gfx_citro3d.c updateDepth */
+#define PORT_ROOM_DL(disp, dl)               \
+    do {                                     \
+        gDPNoOpTag(disp++, 0x3D5E5200);      \
+        gSPDisplayList(disp++, dl);          \
+        gDPNoOpTag(disp++, 0x3D5E5201);      \
+    } while (0)
+/* PORT (2026-11-07): the entries Room_DrawCullable sorted by distance carry their own tags (0x3D5E5202 / 03): drawn
+ * nearest first, so the renderer's "a later entry wins a tie" step (gfx_citro3d.c updateDepth: up to 3.8 units nearer
+ * per 48 entries) pulled the farther surfaces in front of the nearer ones whenever they were less than that apart -
+ * the opening area's floor vanished, the surface under it showing through, as the camera moved and the order changed
+ * (user video). Sorted entries have no authored layering to keep: they all get the same depth. */
+#define PORT_ROOM_DL_SORTED(disp, dl)        \
+    do {                                     \
+        gDPNoOpTag(disp++, 0x3D5E5202);      \
+        gSPDisplayList(disp++, dl);          \
+        gDPNoOpTag(disp++, 0x3D5E5203);      \
+    } while (0)
+#else
+#define PORT_ROOM_DL(disp, dl) gSPDisplayList(disp++, dl)
+#define PORT_ROOM_DL_SORTED(disp, dl) gSPDisplayList(disp++, dl)
+#endif
+
 static Vec3f sZeroVec = { 0.0f, 0.0f, 0.0f };
 
 void Room_DrawNormal(PlayState* play, Room* room, u32 flags) {
@@ -36,11 +61,11 @@ void Room_DrawNormal(PlayState* play, Room* room, u32 flags) {
     entry = Lib_SegmentedToVirtual(roomShape->entries);
     for (i = 0; i < roomShape->numEntries; i++) {
         if ((flags & ROOM_DRAW_OPA) && (entry->opa != NULL)) {
-            gSPDisplayList(POLY_OPA_DISP++, entry->opa);
+            PORT_ROOM_DL(POLY_OPA_DISP, entry->opa);
         }
 
         if ((flags & ROOM_DRAW_XLU) && (entry->xlu != NULL)) {
-            gSPDisplayList(POLY_XLU_DISP++, entry->xlu);
+            PORT_ROOM_DL(POLY_XLU_DISP, entry->xlu);
         }
 
         entry++;
@@ -122,14 +147,14 @@ void Room_DrawCullable(PlayState* play, Room* room, u32 flags) {
                     if (flags & ROOM_DRAW_OPA) {
                         dList = roomShapeCullableEntry->opa;
                         if (dList != NULL) {
-                            gSPDisplayList(POLY_OPA_DISP++, dList);
+                            PORT_ROOM_DL(POLY_OPA_DISP, dList);
                         }
                     }
 
                     if (flags & ROOM_DRAW_XLU) {
                         dList = roomShapeCullableEntry->xlu;
                         if (dList != NULL) {
-                            gSPDisplayList(POLY_XLU_DISP++, dList);
+                            PORT_ROOM_DL(POLY_XLU_DISP, dList);
                         }
                     }
                 }
@@ -137,14 +162,14 @@ void Room_DrawCullable(PlayState* play, Room* room, u32 flags) {
                 if (flags & ROOM_DRAW_OPA) {
                     dList = roomShapeCullableEntry->opa;
                     if (dList != NULL) {
-                        gSPDisplayList(POLY_OPA_DISP++, dList);
+                        PORT_ROOM_DL(POLY_OPA_DISP, dList);
                     }
                 }
 
                 if (flags & ROOM_DRAW_XLU) {
                     dList = roomShapeCullableEntry->xlu;
                     if (dList != NULL) {
-                        gSPDisplayList(POLY_XLU_DISP++, dList);
+                        PORT_ROOM_DL(POLY_XLU_DISP, dList);
                     }
                 }
             }
@@ -166,6 +191,22 @@ void Room_DrawCullable(PlayState* play, Room* room, u32 flags) {
             projectedPos.z *= var_fa1;
 
             var_fv1 = ABS_ALT(roomShapeCullableEntry->boundsSphereRadius);
+#ifdef __3DS__
+            /* PORT (2026-11-15): 60 fps: a piece this camera skips but the previous frame's camera saw is drawn too -
+             * the in-between frames look from between the two (z_play.c gPortPrevViewProjMtxF). Sorted first. */
+            if (!((-var_fv1 < projectedPos.z) && (projectedPos.z - var_fv1 < play->lightCtx.zFar))) {
+                extern MtxF gPortPrevViewProjMtxF;
+                extern s32 gPortPrevViewProjOk;
+                Vec3f prevPos;
+                if (gPortPrevViewProjOk) {
+                    SkinMatrix_Vec3fMtxFMultXYZ(&gPortPrevViewProjMtxF, &pos, &prevPos);
+                    prevPos.z *= var_fa1;
+                    if ((-var_fv1 < prevPos.z) && (prevPos.z - var_fv1 < play->lightCtx.zFar)) {
+                        projectedPos.z = var_fv1 + 1.0f; /* (passes the checks below, nearest point at 1) */
+                    }
+                }
+            }
+#endif
 
             // If the entry bounding sphere isn't fully before the rendered depth range
             if (-var_fv1 < projectedPos.z) {
@@ -243,13 +284,13 @@ void Room_DrawCullable(PlayState* play, Room* room, u32 flags) {
 
                         dList = roomShapeCullableEntry->opa;
                         if (dList != NULL) {
-                            gSPDisplayList(POLY_OPA_DISP++, dList);
+                            PORT_ROOM_DL_SORTED(POLY_OPA_DISP, dList);
                         }
                     }
                 } else {
                     dList = roomShapeCullableEntry->opa;
                     if (dList != NULL) {
-                        gSPDisplayList(POLY_OPA_DISP++, dList);
+                        PORT_ROOM_DL_SORTED(POLY_OPA_DISP, dList);
                     }
                 }
             }
@@ -276,10 +317,10 @@ void Room_DrawCullable(PlayState* play, Room* room, u32 flags) {
                                 var_a1 = 255 - (s32)((temp_fv0 / temp_fv1) * 255.0f);
                             }
                             gDPSetEnvColor(POLY_XLU_DISP++, 255, 255, 255, var_a1);
-                            gSPDisplayList(POLY_XLU_DISP++, dList);
+                            PORT_ROOM_DL_SORTED(POLY_XLU_DISP, dList);
                         }
                     } else {
-                        gSPDisplayList(POLY_XLU_DISP++, dList);
+                        PORT_ROOM_DL_SORTED(POLY_XLU_DISP, dList);
                     }
                 }
             }

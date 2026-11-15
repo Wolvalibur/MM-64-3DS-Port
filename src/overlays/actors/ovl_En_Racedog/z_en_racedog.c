@@ -9,6 +9,7 @@
  */
 
 #include "z_en_racedog.h"
+#include "port_minimap.h"
 #include "overlays/actors/ovl_En_Aob_01/z_en_aob_01.h"
 #include "overlays/actors/ovl_En_Dg/z_en_dg.h"
 
@@ -518,7 +519,7 @@ void EnRacedog_UpdateSpeed(EnRacedog* this) {
 
     // The dog that the player has selected has a slightly higher max speed than the other dogs.
     if (this->index == this->selectedDogIndex) {
-        if (this->actor.speed > 7.5f) {
+        if ((this->actor.speed > 7.5f) || PORT_CHEAT_ON(CHEAT_MINIGAMES)) { /* PORT (2026-11-08): cheat, always win minigames (2S2H Minigames, at their easiest): your dog runs flat out */
             this->actor.speed = 7.5f;
         }
     } else {

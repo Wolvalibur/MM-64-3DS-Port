@@ -5,6 +5,7 @@
  */
 
 #include "z_en_jgame_tsn.h"
+#include "port_minimap.h"
 #include "overlays/actors/ovl_Obj_Jgame_Light/z_obj_jgame_light.h"
 
 #define FLAGS                                                                                  \
@@ -169,7 +170,7 @@ void EnJgameTsn_Idle(EnJgameTsn* this, PlayState* play) {
                 Actor_ChangeAnimationByInfo(&this->skelAnime, sAnimationInfo, ENJGAMETSN_ANIM_TALK_ONE_HAND);
                 Message_StartTextbox(play, 0x10A2, &this->actor);
                 this->textId = 0x10A2;
-            } else if (gSaveContext.minigameScore < 20) {
+            } else if ((gSaveContext.minigameScore < 20) && !PORT_CHEAT_ON(CHEAT_MINIGAMES)) { /* PORT (2026-11-08): cheat, always win minigames (2S2H Minigames, at their easiest) */
                 Actor_ChangeAnimationByInfo(&this->skelAnime, sAnimationInfo, ENJGAMETSN_ANIM_TALK_ONE_HAND);
                 Message_StartTextbox(play, 0x10A2, &this->actor);
                 this->textId = 0x10A2;

@@ -1,5 +1,54 @@
 #include "global.h"
 #include "zelda_arena.h"
+#include "port_interp.h"
+
+#ifdef __3DS__
+/* PORT (2026-10-26): 60 fps - a flex skeleton tells the renderer which matrix slot (segment 0x0D) is whose child
+ * (gPortInterpParent, gfx_pc.c interp_limb), so each limb is blended relative to its parent. The tags go in NOOPs
+ * reserved right after the skeleton's segment 0x0D, filled when the skeleton has been walked. */
+#define PORT_FLEX_MAX 64
+static Mtx* sPortFlexBase;
+static s32 sPortFlexParent = -1;
+static u8 sPortFlexParents[PORT_FLEX_MAX]; /* parent slot, 0xFF none, 0xFE no slot */
+
+static void PortFlex_Begin(Gfx** disp, Gfx** tags, s32 count, Mtx* base) {
+    s32 i;
+    s32 n = count < PORT_FLEX_MAX ? count : PORT_FLEX_MAX;
+    *tags = *disp;
+    for (i = 0; i < n; i++) {
+        gDPNoOp((*disp)++);
+    }
+    sPortFlexBase = base;
+    sPortFlexParent = -1;
+    for (i = 0; i < PORT_FLEX_MAX; i++) {
+        sPortFlexParents[i] = 0xFE;
+    }
+}
+
+static s32 PortFlex_Slot(Mtx* before, Mtx* after) { /* the limb's slot when it took one, else -1 */
+    s32 slot;
+    if (after == before || sPortFlexBase == NULL) {
+        return -1;
+    }
+    slot = before - sPortFlexBase;
+    if (slot < 0 || slot >= PORT_FLEX_MAX) {
+        return -1;
+    }
+    sPortFlexParents[slot] = sPortFlexParent < 0 ? 0xFF : (u8)sPortFlexParent;
+    return slot;
+}
+
+static void PortFlex_End(Gfx* tags, s32 count) {
+    s32 i;
+    s32 n = count < PORT_FLEX_MAX ? count : PORT_FLEX_MAX;
+    for (i = 0; i < n; i++) {
+        if (sPortFlexParents[i] != 0xFE) {
+            gPortInterpParent(&tags[i], i, sPortFlexParents[i]);
+        }
+    }
+    sPortFlexBase = NULL;
+}
+#endif
 
 #define ANIM_INTERP 1
 
@@ -156,6 +205,10 @@ void SkelAnime_DrawFlexLimbLod(PlayState* play, s32 limbIndex, void** skeleton, 
     pos.z = limb->jointPos.z;
 
     newDList = limbDList = limb->dLists[lod];
+#ifdef __3DS__
+    Mtx* portBefore = *mtx;
+    s32 portParent = sPortFlexParent;
+#endif
 
     if ((overrideLimbDraw == NULL) || !overrideLimbDraw(play, limbIndex, &newDList, &pos, &rot, actor)) {
         Matrix_TranslateRotateZYX(&pos, &rot);
@@ -175,9 +228,23 @@ void SkelAnime_DrawFlexLimbLod(PlayState* play, s32 limbIndex, void** skeleton, 
     }
 
     if (limb->child != LIMB_DONE) {
+#ifdef __3DS__
+        {
+            s32 slot = PortFlex_Slot(portBefore, *mtx);
+            if (slot >= 0) {
+                sPortFlexParent = slot;
+            }
+        }
+#endif
         SkelAnime_DrawFlexLimbLod(play, limb->child, skeleton, jointTable, overrideLimbDraw, postLimbDraw, actor, lod,
                                   mtx);
     }
+#ifdef __3DS__
+    else {
+        PortFlex_Slot(portBefore, *mtx);
+    }
+    sPortFlexParent = portParent;
+#endif
 
     Matrix_Pop();
 
@@ -212,6 +279,13 @@ void SkelAnime_DrawFlexLod(PlayState* play, void** skeleton, Vec3s* jointTable, 
     OPEN_DISPS(play->state.gfxCtx);
 
     gSPSegment(POLY_OPA_DISP++, 0x0D, mtx);
+#ifdef __3DS__
+    Gfx* portTags;
+    Mtx* portSavedBase = sPortFlexBase;
+    s32 portSavedParent = sPortFlexParent;
+    Mtx* portBefore = mtx;
+    PortFlex_Begin(&POLY_OPA_DISP, &portTags, dListCount, mtx);
+#endif
     Matrix_Push();
 
     rootLimb = Lib_SegmentedToVirtual(skeleton[0]);
@@ -242,10 +316,21 @@ void SkelAnime_DrawFlexLod(PlayState* play, void** skeleton, Vec3s* jointTable, 
         postLimbDraw(play, 1, &newDList, &limbDList, &rot, actor);
     }
 
+#ifdef __3DS__
+    {
+        s32 slot = PortFlex_Slot(portBefore, mtx);
+        sPortFlexParent = slot;
+    }
+#endif
     if (rootLimb->child != LIMB_DONE) {
         SkelAnime_DrawFlexLimbLod(play, rootLimb->child, skeleton, jointTable, overrideLimbDraw, postLimbDraw, actor,
                                   lod, &mtx);
     }
+#ifdef __3DS__
+    PortFlex_End(portTags, dListCount);
+    sPortFlexBase = portSavedBase;
+    sPortFlexParent = portSavedParent;
+#endif
 
     Matrix_Pop();
 

@@ -24,6 +24,10 @@ CmpDmaBuffer sDmaBuffer;
 #ifdef __3DS__
 // PORT: the archive's offset table is big-endian ROM data (the 3DS is little-endian)
 #define CMPDMA_BE(x) __builtin_bswap32(x)
+// PORT (2026-10-26): what an archive file unpacks to is in N64 byte order (Yaz0 writes bytes): the renderer reads
+// textures there without the ^ 7 unswizzle of natively compiled data (gfx_pc.c gfx_mark_logical_texture)
+void gfx_mark_logical_texture(const void* start, unsigned int size);
+#define PORT_MARK_LOGICAL(dst, size) gfx_mark_logical_texture((dst), (unsigned int)(size))
 #else
 #define CMPDMA_BE(x) (x)
 #endif
@@ -102,8 +106,16 @@ void CmpDma_LoadFileImpl(uintptr_t segmentRom, s32 id, void* dst, size_t size) {
         CmpDma_Decompress(romStart, compressedSize, tempBuf);
         func_80178AC0(tempBuf, dst, size);
         free(tempBuf);
+#ifdef __3DS__
+        PORT_MARK_LOGICAL(dst, size);
+#endif
     } else {
         CmpDma_Decompress(romStart, compressedSize, dst);
+#ifdef __3DS__
+        if (compressedSize != 0) {
+            PORT_MARK_LOGICAL(dst, (uintptr_t)gYaz0DecompressDstEnd - (uintptr_t)dst);
+        }
+#endif
     }
 }
 

@@ -8,6 +8,7 @@
  */
 
 #include "z_en_syateki_man.h"
+#include "port_minimap.h"
 #include "attributes.h"
 #include "overlays/actors/ovl_En_Syateki_Crow/z_en_syateki_crow.h"
 #include "overlays/actors/ovl_En_Syateki_Dekunuts/z_en_syateki_dekunuts.h"
@@ -1059,6 +1060,15 @@ void EnSyatekiMan_Swamp_RunGame(EnSyatekiMan* this, PlayState* play) {
     static s16 sHasSignaledGuaysForThisWave = false;
     Player* player = GET_PLAYER(play);
 
+    /* PORT (2026-11-08): cheat, always win minigames (2S2H Minigames, at their easiest): the swamp gallery's */
+    // perfect score after the first hit
+    if (PORT_CHEAT_ON(CHEAT_MINIGAMES) && (this->score != 0) && (this->score < 2120)) {
+        this->score = 2120;
+        this->currentWave = 4;
+        this->wolfosFlags = 0;
+        this->bonusDekuScrubHitCounter = 2;
+    }
+
     if (((this->dekuScrubFlags == 0) || (this->guayAppearTimer > 140)) && !sHasSignaledGuaysForThisWave &&
         (this->currentWave < SG_SWAMP_WAVE_COUNT)) {
         // Make three Guays appear after the player has killed all Deku Scrubs, or after 140 frames.
@@ -1342,8 +1352,15 @@ static const s32 sOctorokFlagsPerWave[] = {
 void EnSyatekiMan_Town_RunGame(EnSyatekiMan* this, PlayState* play) {
     static s32 sModFromLosingTime = 0;
     Player* player = GET_PLAYER(play);
-    s32 timer =
-        (((void)0, gSaveContext.timerCurTimes[TIMER_ID_MINIGAME_1]) * 0.1f) + 1.0f; // unit is tenths of a second
+    s32 timer;
+
+    /* PORT (2026-11-08): cheat, always win minigames (2S2H Minigames, at their easiest): the town gallery's perfect */
+    // score after the first hit
+    if (PORT_CHEAT_ON(CHEAT_MINIGAMES) && (this->score >= 1) && (this->score < 50)) {
+        this->score = 50;
+        gSaveContext.timerCurTimes[TIMER_ID_MINIGAME_1] = 0;
+    }
+    timer = (((void)0, gSaveContext.timerCurTimes[TIMER_ID_MINIGAME_1]) * 0.1f) + 1.0f; // unit is tenths of a second
 
     if (timer <= 750) {
         s32 waveTimer; // unit is hundredths of a second

@@ -1,4 +1,5 @@
 #include "z64save.h"
+#include "port_minimap.h"
 #include "global.h"
 
 #include "sys_flashrom.h"
@@ -433,6 +434,10 @@ void Sram_SaveEndOfCycle(PlayState* play) {
     s32 i;
     u8 slot;
     u8 item;
+
+#ifdef __3DS__
+    PortSram_DeleteKeptOwlSave(play); /* PORT: a kept owl / pause save ends with the cycle */
+#endif
 
     gSaveContext.save.timeSpeedOffset = 0;
     gSaveContext.save.eventDayCount = 0;
@@ -1320,7 +1325,14 @@ void Sram_OpenSave(FileSelectState* fileSelect, SramContext* sramCtx) {
         }
 
         fileNum = gSaveContext.fileNum;
+#ifdef __3DS__
+        /* PORT: a pause save loads at its own entrance; it and (option) owl saves are kept when loaded (2S2H) */
+        if (!PortEnh_PauseSaveLoadEntrance() && !gPortOwlPersist) {
+            func_80147314(sramCtx, fileNum);
+        }
+#else
         func_80147314(sramCtx, fileNum);
+#endif
     }
 }
 
@@ -2041,3 +2053,34 @@ void func_80147414(SramContext* sramCtx, s32 fileNum, s32 arg2) {
 
 void Sram_nop8014750C(UNK_TYPE4 arg0) {
 }
+
+#ifdef __3DS__
+/* PORT (2026-10-26): owl saves kept after loading (persistent owl saves, pause saves: ultra_shims.c) are deleted where the
+ * game would no longer find one: a new cycle, the moon crash (2S2H SavingEnhancements DeleteOwlSave) */
+void PortSram_DeleteKeptOwlSave(PlayState* play) {
+    u8 isOwlSave = gSaveContext.save.isOwlSave;
+
+    if ((gSaveContext.fileNum == 0xFF) || !gSaveContext.flashSaveAvailable || (play->sramCtx.saveBuf == NULL)) {
+        return;
+    }
+    func_80147314(&play->sramCtx, gSaveContext.fileNum);
+    gSaveContext.save.isOwlSave = isOwlSave;
+}
+
+/* the pause screen's SAVE: an owl save of where Link is, written at once, and the game goes on */
+s32 PortSram_PauseOwlSave(PlayState* play) {
+    s32 fileNum = gSaveContext.fileNum;
+    u8 isOwlSave = gSaveContext.save.isOwlSave;
+
+    if ((fileNum == 0xFF) || !gSaveContext.flashSaveAvailable || (play->sramCtx.saveBuf == NULL)) {
+        return false;
+    }
+    gSaveContext.save.isOwlSave = true;
+    Play_SaveCycleSceneFlags(play);
+    func_8014546C(&play->sramCtx);
+    Sram_SyncWriteToFlash(&play->sramCtx, gFlashOwlSaveStartPages[fileNum * 2], gFlashOwlSaveNumPages[fileNum * 2]);
+    Sram_SyncWriteToFlash(&play->sramCtx, gFlashOwlSaveStartPages[fileNum * 2 + 1], gFlashOwlSaveNumPages[fileNum * 2]);
+    gSaveContext.save.isOwlSave = isOwlSave;
+    return true;
+}
+#endif

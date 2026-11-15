@@ -309,6 +309,50 @@ s32 View_Apply(View* view, s32 mask) {
     }
 }
 
+#ifdef __3DS__
+#include "port_interp.h"
+/* PORT (2026-10-26): 60 fps interpolation, taken from the OoT N64 3DS Port (z_view.c): camera cut detection per view
+ * (Zelda64Recomp camera_transform_tagging.c should_interpolate_perspective). A jump of the eye or the look-at point,
+ * or a sudden change of the eye's velocity, is a cut and that frame is drawn without blending. The MM port had no
+ * interpolation tags at all, so "60 fps" showed every logic frame three times (user report: 60 fps did little). */
+int gPortInterpCameraCut;
+static u32 Port_ViewInterpFlags(View* view) {
+    static View* sView[4];
+    static Vec3f sEye[4], sAt[4], sVel[4];
+    static u32 sFrame[4];
+    static u8 sCut[4], sNext;
+    u32 frame = view->gfxCtx->gfxPoolIdx;
+    s32 i;
+    for (i = 0; i < 4; i++) {
+        if (sView[i] == view) {
+            break;
+        }
+    }
+    if (i == 4) {
+        i = sNext++ & 3;
+        sView[i] = view;
+        sFrame[i] = frame - 2;
+    }
+    if (sFrame[i] != frame) {
+        Vec3f de, da;
+        f32 dEye, dAt, dVel;
+        de.x = view->eye.x - sEye[i].x, de.y = view->eye.y - sEye[i].y, de.z = view->eye.z - sEye[i].z;
+        da.x = view->at.x - sAt[i].x, da.y = view->at.y - sAt[i].y, da.z = view->at.z - sAt[i].z;
+        dEye = sqrtf(de.x * de.x + de.y * de.y + de.z * de.z);
+        dAt = sqrtf(da.x * da.x + da.y * da.y + da.z * da.z);
+        dVel = sqrtf((de.x - sVel[i].x) * (de.x - sVel[i].x) + (de.y - sVel[i].y) * (de.y - sVel[i].y) +
+                     (de.z - sVel[i].z) * (de.z - sVel[i].z));
+        sCut[i] = (sFrame[i] != frame - 1) || dEye > 300.0f || dAt > 300.0f || dVel > 100.0f;
+        sVel[i] = de;
+        sEye[i] = view->eye;
+        sAt[i] = view->at;
+        sFrame[i] = frame;
+        gPortInterpCameraCut = sCut[i];
+    }
+    return sCut[i] ? PORT_INTERP_SKIP : 0;
+}
+#endif
+
 s32 View_ApplyPerspective(View* view) {
     f32 aspect;
     s32 width;
@@ -343,6 +387,13 @@ s32 View_ApplyPerspective(View* view) {
 
     View_StepDistortion(view, projection);
 
+#ifdef __3DS__
+    {
+        u32 portInterpFlags = Port_ViewInterpFlags(view);
+        gPortInterpPush(POLY_OPA_DISP++, PORT_INTERP_ID_CAMERA, portInterpFlags);
+        gPortInterpPush(POLY_XLU_DISP++, PORT_INTERP_ID_CAMERA, portInterpFlags);
+    }
+#endif
     gSPPerspNormalize(POLY_OPA_DISP++, view->perspNorm);
     gSPMatrix(POLY_OPA_DISP++, projection, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
     gSPPerspNormalize(POLY_XLU_DISP++, view->perspNorm);
@@ -363,6 +414,10 @@ s32 View_ApplyPerspective(View* view) {
 
     gSPMatrix(POLY_OPA_DISP++, viewing, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
     gSPMatrix(POLY_XLU_DISP++, viewing, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_PROJECTION);
+#ifdef __3DS__
+    gPortInterpPop(POLY_OPA_DISP++);
+    gPortInterpPop(POLY_XLU_DISP++);
+#endif
 
     CLOSE_DISPS(gfxCtx);
 

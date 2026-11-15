@@ -5,6 +5,7 @@
  */
 
 #include "z_obj_skateblock.h"
+#include "port_minimap.h"
 #include "assets/objects/gameplay_dangeon_keep/gameplay_dangeon_keep.h"
 
 #define FLAGS (ACTOR_FLAG_UPDATE_CULLING_DISABLED)
@@ -528,7 +529,7 @@ void func_80A22334(ObjSkateblock* this, PlayState* play) {
 
     if (sp2C == -1) {
         sp30 = false;
-    } else if (!(this->unk_1C1 & 2) && (this->unk_172[sp2C] > 10) && (D_80A22A10 == 0) &&
+    } else if (!(this->unk_1C1 & 2) && (this->unk_172[sp2C] > (PORT_ENH(ENH_FAST_PUSH) ? 0 : 10)) && (D_80A22A10 == 0) && /* PORT (2026-11-08): 2S2H Player/FasterPushAndPull (GAMEPLAY: Faster block pushing) */
                !func_80A216D4(this, play, 2.0f, &sp20) && !Player_InCsMode(play)) {
         func_80A21C88(this, sp2C);
         func_80A2244C(this);

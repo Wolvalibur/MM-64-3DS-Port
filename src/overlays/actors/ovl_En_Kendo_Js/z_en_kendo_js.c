@@ -5,6 +5,7 @@
  */
 
 #include "z_en_kendo_js.h"
+#include "port_minimap.h"
 #include "overlays/actors/ovl_En_Maruta/z_en_maruta.h"
 
 #define FLAGS                                                                                  \
@@ -626,6 +627,14 @@ void EnKendoJs_MovePlayerToStartExpertCourse(EnKendoJs* this, PlayState* play) {
 
 void EnKendoJs_ExpertCourse(EnKendoJs* this, PlayState* play) {
     Player* player = GET_PLAYER(play);
+
+    /* PORT (2026-11-08): cheat, always win minigames (2S2H Minigames, at their easiest): the expert course */
+    // passed with full marks after the first log
+    if (PORT_CHEAT_ON(CHEAT_MINIGAMES) && (gSaveContext.minigameScore >= 1)) {
+        this->timer = 140;
+        this->minigameRound.expertRound = 5;
+        gSaveContext.minigameScore = 30;
+    }
 
     if (this->timer >= 140) {
         if (this->minigameRound.expertRound == 5) {

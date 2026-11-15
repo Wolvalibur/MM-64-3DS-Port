@@ -35,6 +35,11 @@ typedef struct {
 } FaultDrawer; // size = 0x3C
 
 //! TODO: Extract the font data properly so we don't have to cast in sFaultDrawerDefault below
+#ifdef __3DS__
+/* PORT (2026-11-15): in a writable section, so the ROM-free package can take it out (gen_asset_tables.py --romfree
+ * leaves read-only data in) and put it back from the player's ROM at boot */
+__attribute__((section(".data.port_rf_font")))
+#endif
 const u8 sFaultDrawerFont[] = {
 #include "assets/boot/fault_drawer/sFaultDrawerFont.bin.inc.c"
 };

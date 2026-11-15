@@ -1,3 +1,6 @@
+#ifdef __3DS__
+#include "port_interp.h"
+#endif
 #include "global.h"
 
 Mtx* sSkyboxDrawMatrix;
@@ -36,7 +39,14 @@ void Skybox_Draw(SkyboxContext* skyboxCtx, GraphicsContext* gfxCtx, s16 skyboxId
     Matrix_RotateYF(skyboxCtx->rot.y, MTXMODE_APPLY);
     Matrix_RotateZF(skyboxCtx->rot.z, MTXMODE_APPLY);
     Matrix_ToMtx(sSkyboxDrawMatrix);
+#ifdef __3DS__
+    /* PORT (2026-10-26): 60 fps - the sky box follows the camera eye (from the OoT N64 3DS Port) */
+    gPortInterpPush(POLY_OPA_DISP++, PORT_INTERP_ID_SKYBOX, gPortInterpCameraCut ? PORT_INTERP_SKIP : 0);
+#endif
     gSPMatrix(POLY_OPA_DISP++, sSkyboxDrawMatrix, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+#ifdef __3DS__
+    gPortInterpPop(POLY_OPA_DISP++);
+#endif
 
     // Enable magic square RGB dithering and bilinear filtering
     gDPSetColorDither(POLY_OPA_DISP++, G_CD_MAGICSQ);
